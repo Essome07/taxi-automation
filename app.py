@@ -25,11 +25,10 @@ else:
     creds = Credentials.from_service_account_info(st.secrets["google_credentials"], scopes=scope)
 
 client = gspread.authorize(creds)
-# Remplace par le nom exact de ton classeur et de ta feuille
-feuille = client.open("Journal Hebdomadaire").worksheet("Entre")
-# Connexion au document principal pour le bilan mensuel
-feuille_principale = client.open("Copie de Journal_Hebdomadaire").worksheet("Income")
 
+# .get_worksheet(0) sélectionne le tout premier onglet, peu importe son nom
+feuille = client.open_by_key("1aoLjyA10sSb1m1hEr0bDPj8gxB2CZ22RLnkKKkrCpMM").get_worksheet(0)
+feuille_principale = client.open_by_key("1BNlV17OasazXtFPLbp64xHwJ2RqBjPqs97_Adi4Cbuo").get_worksheet(0)
 # --- INTERFACE STREAMLIT ---
 st.title("🚖 Taxi Dashboard - Automatisation")
 st.write("Uploade le rapport hebdomadaire pour l'envoyer dans Google Sheets.") 
