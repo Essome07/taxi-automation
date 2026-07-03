@@ -151,7 +151,7 @@ if file is not None:
                     # On enregistre le montant cumulé final
                     feuille_principale.update_cell(4, colonne_mois, nouveau_total_mois)
 
-                    st.balloons()
+                
                     st.success("📊 Bilan mensuel automatiquement consolidé et envoyé sur le fichier principal !")
                     
                     # Réinitialisation du fichier secondaire pour le mois suivant
