@@ -109,7 +109,7 @@ if file is not None:
                 donnees.get("solde_net")         # Colonne D : Soldes finals
                 ])
                 
-                st.balloons()
+            
                 st.success("✨ Données ajoutées à Google Sheets avec succès !")
                 # --- CONSOLIDATION MENSUELLE AUTOMATIQUE ---
                 toutes_les_lignes = feuille.get_all_values()
