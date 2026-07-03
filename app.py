@@ -5,16 +5,25 @@ import json
 import gspread
 import datetime 
 import base64
+import os
+import streamlit as st 
 from google.oauth2.service_account import Credentials
-# --- CONFIGURATION INITIALE ---
-API_KEY = "AQ.Ab8RN6LzmBzLmmus_jP5gcPgIOBeu4hUA971zpojR_0vwAxSEQ"  # Remplace par ta clé
 
-# Configuration Google Sheets
+# --- CONFIGURATION INITIALE ---
 scope = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
-creds = Credentials.from_service_account_file("credentials.json", scopes=scope) # Ajuste le nom de ton fichier de clés
+
+if os.path.exists("credentials.json"):
+    # Mode LOCAL (sur ton PC)
+    API_KEY = "AQ.Ab8RN6LzmBzLmmus_jP5gcPgIOBeu4hUA971zpojR_0vwAxSEQ"
+    creds = Credentials.from_service_account_file("credentials.json", scopes=scope)
+else:
+    # Mode CLOUD (sur Streamlit Cloud)
+    API_KEY = st.secrets["GEMINI_API_KEY"]
+    creds = Credentials.from_service_account_info(st.secrets["google_credentials"], scopes=scope)
+
 client = gspread.authorize(creds)
 # Remplace par le nom exact de ton classeur et de ta feuille
 feuille = client.open("Journal Hebdomadaire").worksheet("Entre")
