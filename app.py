@@ -266,10 +266,18 @@ def appeler_gemini(api_key: str, image_b64: str, mime_type: str, tentatives: int
                 "quelques minutes."
             )
 
-        try:
-            reponse.raise_for_status()
-        except requests.HTTPError as exc:
-            raise RuntimeError(masquer_cle_api(str(exc))) from exc
+        if reponse.status_code >= 400:
+            message_detaille = ""
+            try:
+                message_detaille = reponse.json().get("error", {}).get("message", "")
+            except Exception:
+                pass
+            if not message_detaille:
+                message_detaille = reponse.text[:400] or f"Erreur HTTP {reponse.status_code} sans détail."
+            raise RuntimeError(
+                masquer_cle_api(f"Erreur Gemini {reponse.status_code} : {message_detaille}")
+            )
+
         return reponse.json()
 
 
