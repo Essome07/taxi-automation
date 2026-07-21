@@ -42,7 +42,7 @@ SCOPES = [
 # Valeur par défaut (utilisée tant que rien n'est configuré dans ⚙️ Paramètres)
 SHEET_PRINCIPALE_ID_DEFAUT = "1BNlV17OasazXtFPLbp64xHwJ2RqBjPqs97_Adi4Cbuo"
 
-GEMINI_MODEL = "gemini-3.5-flash"  # à ajuster si le nom du modèle change côté Google AI Studio
+GEMINI_MODEL = "gemini-2.5-flash"  # à ajuster si le nom du modèle change côté Google AI Studio
 
 CONFIG_PATH = "config_app.json"
 
@@ -189,6 +189,15 @@ def encoder_image(fichier) -> tuple[str, str]:
     return base64.b64encode(contenu).decode("utf-8"), mime_type
 
 
+def masquer_cle_api(texte: str) -> str:
+    """Retire toute clé API visible d'un message d'erreur (ex: dans une URL
+    '...?key=AQ.xxxx'), pour qu'elle ne puisse plus jamais être exposée par
+    accident (capture d'écran, logs, partage...)."""
+    if not texte:
+        return texte
+    return re.sub(r"key=[^&\s\"'\)]+", "key=***MASQUÉE***", texte)
+
+
 def appeler_gemini(api_key: str, image_b64: str, mime_type: str, tentatives: int = 3) -> dict:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
     payload = {
@@ -205,9 +214,33 @@ def appeler_gemini(api_key: str, image_b64: str, mime_type: str, tentatives: int
     }
 
     for essai in range(1, tentatives + 1):
-        reponse = requests.post(url, json=payload, timeout=60)
+        try:
+            reponse = requests.post(url, json=payload, timeout=60)
+        except requests.RequestException as exc:
+            raise RuntimeError(masquer_cle_api(str(exc))) from exc
+
+        if reponse.status_code == 401 or reponse.status_code == 403:
+            raise RuntimeError(
+                f"Authentification refusée par Gemini (erreur {reponse.status_code}). "
+                "La clé API est invalide, désactivée, ou le projet Google Cloud associé "
+                "est suspendu. Vérifie l'état de ton projet sur Google AI Studio / Google Cloud Console."
+            )
 
         if reponse.status_code == 429:
+            message_api = ""
+            try:
+                message_api = reponse.json().get("error", {}).get("message", "")
+            except Exception:
+                pass
+
+            if "PerDay" in message_api or "per day" in message_api.lower():
+                raise RuntimeError(
+                    "Quota GRATUIT journalier Gemini atteint pour aujourd'hui (erreur 429). "
+                    "Inutile de réessayer maintenant : ce quota se réinitialise automatiquement "
+                    "le lendemain. Pour lever cette limite tout de suite, active la facturation "
+                    "sur Google AI Studio."
+                )
+
             attente = int(reponse.headers.get("Retry-After", 15 * essai))
             if essai < tentatives:
                 st.warning(f"⏳ Limite de débit Gemini atteinte, nouvelle tentative dans {attente}s...")
@@ -218,7 +251,25 @@ def appeler_gemini(api_key: str, image_b64: str, mime_type: str, tentatives: int
                 "Attends 1 à 2 minutes avant de réessayer, ou vérifie ton quota sur Google AI Studio."
             )
 
-        reponse.raise_for_status()
+        if reponse.status_code in (500, 502, 503, 504):
+            attente = 5 * essai
+            if essai < tentatives:
+                st.warning(
+                    f"⏳ Le service Gemini est momentanément indisponible (erreur {reponse.status_code}), "
+                    f"nouvelle tentative dans {attente}s..."
+                )
+                time.sleep(attente)
+                continue
+            raise RuntimeError(
+                f"Le service Gemini est indisponible (erreur {reponse.status_code}) après plusieurs tentatives. "
+                "C'est un problème temporaire côté Google, pas un bug de l'application : réessaie dans "
+                "quelques minutes."
+            )
+
+        try:
+            reponse.raise_for_status()
+        except requests.HTTPError as exc:
+            raise RuntimeError(masquer_cle_api(str(exc))) from exc
         return reponse.json()
 
 
@@ -586,6 +637,25 @@ if st.session_state.page == "⚙️ Paramètres":
             except Exception as e:
                 st.error(f"🚨 Connexion impossible : {e}")
 
+    st.divider()
+    st.subheader("Quelle clé Gemini l'app utilise-t-elle réellement ?")
+    st.caption(
+        "Utile après un changement de clé API : confirme que l'app a bien pris en compte "
+        "la nouvelle clé (sans jamais afficher la clé en entier)."
+    )
+    if st.button("🔑 Afficher les derniers caractères de la clé chargée"):
+        try:
+            cle_active = st.secrets["GEMINI_API_KEY"]
+            masque = f"{cle_active[:6]}...{cle_active[-4:]} (longueur : {len(cle_active)} caractères)"
+            st.info(f"Clé actuellement chargée par l'app : `{masque}`")
+            st.caption(
+                "Compare ces derniers caractères avec ceux de ta nouvelle clé dans Google AI Studio. "
+                "S'ils ne correspondent pas, l'app utilise encore l'ancienne clé : il faut mettre à jour "
+                "le secret puis redémarrer/redéployer l'application."
+            )
+        except Exception as e:
+            st.error(f"🚨 Impossible de lire la clé configurée : {e}")
+
 # ============================================================
 # PAGE : MAINTENANCE
 # ============================================================
@@ -655,6 +725,10 @@ else:
             st.divider()
             st.subheader("🗓️ Étape 1 — Analyse du lot mensuel")
             st.write("Les 5 rapports vont être lus par l'IA afin d'identifier le mois couvert, avant tout enregistrement.")
+            st.caption(
+                f"Modèle utilisé : `{GEMINI_MODEL}`. Les 5 images sont envoyées avec quelques secondes "
+                "d'écart entre chacune pour rester dans les limites du palier gratuit Gemini."
+            )
             st.image(list(fichiers), caption=[f.name for f in fichiers], width=130)
 
             if st.button("🔍 Analyser le lot (5 rapports)", type="primary"):
@@ -662,8 +736,10 @@ else:
                     try:
                         api_key, _ = get_clients_config()
                         resultats_lot = []
-                        for f in fichiers:
+                        for idx_f, f in enumerate(fichiers):
                             try:
+                                if idx_f > 0:
+                                    time.sleep(6)  # laisse respirer le quota requêtes/minute entre 2 images (palier gratuit)
                                 image_b64, mime_type = encoder_image(f)
                                 res_json = appeler_gemini(api_key, image_b64, mime_type)
                                 donnees = extraire_donnees(res_json)
@@ -683,11 +759,11 @@ else:
                                         donnees["periode_hebdo"] = periode_semaine_courante()
                                 resultats_lot.append(donnees)
                             except Exception as e:
-                                resultats_lot.append({"erreur": str(e)})
+                                resultats_lot.append({"erreur": masquer_cle_api(str(e))})
                         st.session_state.lot_donnees = resultats_lot
                         st.rerun()
                     except Exception as e:
-                        st.error(f"🚨 Erreur lors de la connexion : {e}")
+                        st.error(f"🚨 Erreur lors de la connexion : {masquer_cle_api(str(e))}")
             st.stop()
 
         # ============================================================
