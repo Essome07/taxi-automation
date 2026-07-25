@@ -1249,7 +1249,7 @@ else:
                         try:
                             _, feuille_principale = get_clients_config()
                             enregistrer_bilan_mensuel(feuille_principale, rapport)
-                            st.session_sta"""
+                            st.session_state"""
 Taxi Dashboard - Automatisation du remplissage Google Sheets
 ==============================================================
 Le taximan envoie un lot de 5 photos de rapports hebdomadaires manuscrits
