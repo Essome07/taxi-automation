@@ -42,7 +42,7 @@ SCOPES = [
 # Valeur par défaut (utilisée tant que rien n'est configuré dans ⚙️ Paramètres)
 SHEET_PRINCIPALE_ID_DEFAUT = "1BNlV17OasazXtFPLbp64xHwJ2RqBjPqs97_Adi4Cbuo"
 
-GEMINI_MODEL = "gemini-2.5-flash"  # à ajuster si le nom du modèle change côté Google AI Studio
+GEMINI_MODEL = "gemini-3.1-flash-lite"  # confirmé via l'endpoint ListModels : GA, supporte generateContent
 
 CONFIG_PATH = "config_app.json"
 
