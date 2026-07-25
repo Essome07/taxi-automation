@@ -887,36 +887,32 @@ else:
             idx = st.session_state.page_confirmation
             nb_validees = len(st.session_state.fichiers_valides)
 
-            def aller_a_photo(nouvel_idx: int) -> None:
-                """Change de page ET synchronise l'état interne du menu déroulant,
-                sinon celui-ci écrase la navigation au prochain rendu (bug Streamlit
-                classique quand un widget à clé et des boutons pilotent la même valeur)."""
-                st.session_state.page_confirmation = nouvel_idx
-                st.session_state.select_nav_confirm = nouvel_idx
-
             st.progress(nb_validees / total_fichiers)
             st.caption(f"{nb_validees} / {total_fichiers} photos confirmées")
 
             nav1, nav2, nav3 = st.columns([1, 3, 1])
             with nav1:
                 if st.button("◀ Précédent", disabled=idx == 0, use_container_width=True, key="nav_prec_confirm"):
-                    aller_a_photo(idx - 1)
+                    st.session_state.page_confirmation = idx - 1
                     st.rerun()
             with nav2:
+                # Clé dynamique (inclut idx) : le widget se recrée à chaque
+                # changement de page et respecte alors 'index=', au lieu de
+                # garder un état figé qui écraserait la navigation par boutons.
                 choix_confirm = st.selectbox(
                     "Aller à la photo",
                     options=list(range(total_fichiers)),
                     format_func=lambda i: f"Photo {i + 1}" + (" ✅" if i in st.session_state.fichiers_valides else ""),
                     index=idx,
                     label_visibility="collapsed",
-                    key="select_nav_confirm",
+                    key=f"select_nav_confirm_{idx}",
                 )
                 if choix_confirm != idx:
-                    aller_a_photo(choix_confirm)
+                    st.session_state.page_confirmation = choix_confirm
                     st.rerun()
             with nav3:
                 if st.button("Suivant ▶", disabled=idx == total_fichiers - 1, use_container_width=True, key="nav_suiv_confirm"):
-                    aller_a_photo(idx + 1)
+                    st.session_state.page_confirmation = idx + 1
                     st.rerun()
 
             st.markdown(f"### Photo {idx + 1} / {total_fichiers}")
@@ -939,7 +935,7 @@ else:
                     if st.button("✅ Oui, c'est la bonne photo", type="primary", use_container_width=True, key=f"oui_{idx}"):
                         st.session_state.fichiers_valides.add(idx)
                         if idx < total_fichiers - 1:
-                            aller_a_photo(idx + 1)
+                            st.session_state.page_confirmation = idx + 1
                         st.rerun()
                 with col_non:
                     if st.button("🔄 Non, remplacer cette photo", use_container_width=True, key=f"non_{idx}"):
@@ -958,7 +954,7 @@ else:
                     st.session_state[f"afficher_remplacement_{idx}"] = False
                     st.success("✅ Nouvelle photo enregistrée pour cette semaine.")
                     if idx < total_fichiers - 1:
-                        aller_a_photo(idx + 1)
+                        st.session_state.page_confirmation = idx + 1
                     st.rerun()
                 if st.button("↩️ Annuler, garder la photo précédente", key=f"annuler_remplacement_{idx}"):
                     st.session_state[f"afficher_remplacement_{idx}"] = False
@@ -1223,32 +1219,29 @@ else:
 
         st.divider()
 
-        def aller_a_page(nouvel_idx: int) -> None:
-            """Change de page ET synchronise l'état interne du menu déroulant
-            (même correctif que pour la navigation des photos à l'Étape 1)."""
-            st.session_state.sous_page = nouvel_idx
-            st.session_state.select_nav_semaine = nouvel_idx
-
         nav1, nav2, nav3 = st.columns([1, 3, 1])
         with nav1:
             if st.button("◀ Précédent", disabled=st.session_state.sous_page == 0, use_container_width=True, key="nav_prec_semaine"):
-                aller_a_page(st.session_state.sous_page - 1)
+                st.session_state.sous_page -= 1
                 st.rerun()
         with nav2:
+            # Clé dynamique (inclut sous_page) : le widget se recrée à chaque
+            # changement de page et respecte alors 'index=', au lieu de garder
+            # un état figé qui écraserait la navigation par boutons.
             choix_page = st.selectbox(
                 "Aller à la page",
                 options=list(range(nb_pages)),
                 format_func=lambda i: noms_pages[i],
                 index=st.session_state.sous_page,
                 label_visibility="collapsed",
-                key="select_nav_semaine",
+                key=f"select_nav_semaine_{st.session_state.sous_page}",
             )
             if choix_page != st.session_state.sous_page:
-                aller_a_page(choix_page)
+                st.session_state.sous_page = choix_page
                 st.rerun()
         with nav3:
             if st.button("Suivant ▶", disabled=st.session_state.sous_page == nb_pages - 1, use_container_width=True, key="nav_suiv_semaine"):
-                aller_a_page(st.session_state.sous_page + 1)
+                st.session_state.sous_page += 1
                 st.rerun()
 
         page_actuelle = st.session_state.sous_page
