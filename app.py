@@ -410,6 +410,24 @@ def hachage_fichier(fichier) -> str:
     return empreinte
 
 
+def estimer_ordre_upload(fichiers: list) -> list:
+    """Avant toute analyse IA, estime un ordre chronologique plausible à
+    partir de l'horodatage souvent présent dans le nom du fichier (ex :
+    captures d'écran 'Capture d'écran 2026-07-03 023326.png'). Purement
+    indicatif pour l'affichage de l'étape de confirmation : l'ordre
+    définitif est de toute façon recalculé après analyse, à partir des
+    dates réellement lues sur les photos elles-mêmes."""
+    motif = re.compile(r"(\d{4})-(\d{2})-(\d{2})[ _-](\d{2})(\d{2})(\d{2})")
+
+    def cle(i):
+        m = motif.search(fichiers[i].name)
+        if m:
+            return (0, tuple(int(x) for x in m.groups()))
+        return (1, i)
+
+    return sorted(range(len(fichiers)), key=cle)
+
+
 def calculer_ordre_chronologique(resultats_lot: list[dict]) -> list[int]:
     """Détermine automatiquement l'ordre chronologique (du plus ancien au
     plus récent) des rapports du lot, à partir de la période détectée par
@@ -623,6 +641,7 @@ for cle, defaut in {
     "fichiers_valides": set(),
     "fichiers_remplaces": {},
     "ordre_chronologique": None,
+    "ordre_upload_estime": None,
 }.items():
     if cle not in st.session_state:
         st.session_state[cle] = defaut
@@ -651,6 +670,7 @@ def reinitialiser_lot() -> None:
     st.session_state.fichiers_valides = set()
     st.session_state.fichiers_remplaces = {}
     st.session_state.ordre_chronologique = None
+    st.session_state.ordre_upload_estime = None
 
 
 def obtenir_donnees_semaine(i: int, champ: str) -> list:
@@ -845,9 +865,11 @@ else:
             st.session_state.fichiers_valides = set()
             st.session_state.fichiers_remplaces = {}
             st.session_state.ordre_chronologique = None
+            st.session_state.ordre_upload_estime = estimer_ordre_upload(fichiers)
 
         total_fichiers = len(fichiers)
-        fichiers_effectifs = [st.session_state.fichiers_remplaces.get(i, f) for i, f in enumerate(fichiers)]
+        fichiers_pre_triees = [fichiers[j] for j in st.session_state.ordre_upload_estime]
+        fichiers_effectifs = [st.session_state.fichiers_remplaces.get(i, f) for i, f in enumerate(fichiers_pre_triees)]
 
         # ============================================================
         # ÉTAPE 1 : confirmation visuelle des photos, une par page
@@ -857,8 +879,9 @@ else:
             st.subheader("🖼️ Étape 1 — Confirmation des photos")
             st.caption(
                 "Vérifie que chaque photo est bien lisible et correspond à un rapport hebdomadaire distinct. "
-                "Pas besoin de les classer toi-même : l'ordre chronologique (Semaine 1 à 5) sera déterminé "
-                "automatiquement d'après les dates lues sur chaque photo, lors de l'analyse."
+                "Elles sont déjà pré-triées par date de capture, mais ce classement n'est qu'indicatif : "
+                "l'ordre chronologique définitif (Semaine 1 à 5) sera déterminé automatiquement d'après les "
+                "dates lues sur chaque photo, lors de l'analyse."
             )
 
             idx = st.session_state.page_confirmation
@@ -1313,4 +1336,3 @@ else:
                             st.rerun()
                         except Exception as e:
                             st.error(f"🚨 Une erreur est survenue lors de l'enregistrement : {e}")
-                            
