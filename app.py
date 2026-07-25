@@ -19,6 +19,7 @@ Interface organisée en 3 sections (barre latérale) :
 
 import base64
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -390,6 +391,63 @@ def detecter_trous_hebdomadaires(lot_donnees: list[dict]) -> list:
     return trous
 
 
+def hachage_fichier(fichier) -> str:
+    fichier.seek(0)
+    empreinte = hashlib.md5(fichier.read()).hexdigest()
+    fichier.seek(0)
+    return empreinte
+
+
+def detecter_doublons(fichiers: list, lot_donnees: list[dict]) -> list[dict]:
+    """Repère les anomalies de doublon dans le lot :
+    - deux fichiers strictement identiques (même image envoyée deux fois)
+    - deux rapports dont les périodes sont identiques ou se chevauchent
+    Renvoie une liste d'alertes {"gravite": "erreur"|"avertissement", "message": str}."""
+    alertes = []
+
+    empreintes: dict = {}
+    for i, f in enumerate(fichiers):
+        empreintes.setdefault(hachage_fichier(f), []).append(i)
+    for indices in empreintes.values():
+        if len(indices) > 1:
+            noms = ", ".join(f"Semaine {i + 1}" for i in indices)
+            alertes.append({
+                "gravite": "erreur",
+                "message": f"{noms} sont EXACTEMENT la même image (fichier identique) — doublon très probable.",
+            })
+
+    periodes = []
+    for i, donnees in enumerate(lot_donnees):
+        if isinstance(donnees, dict) and "erreur" not in donnees:
+            p = parser_periode(donnees.get("periode_hebdo", ""))
+            if p:
+                periodes.append((i, p[0], p[1]))
+
+    for a in range(len(periodes)):
+        for b in range(a + 1, len(periodes)):
+            i1, d1, f1 = periodes[a]
+            i2, d2, f2 = periodes[b]
+            if d1 <= f2 and d2 <= f1:
+                if d1 == d2 and f1 == f2:
+                    alertes.append({
+                        "gravite": "erreur",
+                        "message": (
+                            f"Semaine {i1 + 1} et Semaine {i2 + 1} couvrent EXACTEMENT la même période "
+                            f"({d1.strftime('%d/%m/%y')} - {f1.strftime('%d/%m/%y')}) : doublon probable."
+                        ),
+                    })
+                else:
+                    alertes.append({
+                        "gravite": "avertissement",
+                        "message": (
+                            f"Semaine {i1 + 1} et Semaine {i2 + 1} ont des périodes qui se chevauchent "
+                            f"({d1.strftime('%d/%m/%y')}-{f1.strftime('%d/%m/%y')} et "
+                            f"{d2.strftime('%d/%m/%y')}-{f2.strftime('%d/%m/%y')})."
+                        ),
+                    })
+    return alertes
+
+
 def formater_montant(valeur: float) -> str:
     if float(valeur).is_integer():
         return str(int(valeur))
@@ -515,6 +573,8 @@ for cle, defaut in {
     "mois_confirme": False,
     "sous_page": 0,
     "bilan_enregistre": False,
+    "trous_ignores": set(),
+    "fichiers_combles": {},
 }.items():
     if cle not in st.session_state:
         st.session_state[cle] = defaut
@@ -536,6 +596,8 @@ def reinitialiser_lot() -> None:
     st.session_state.mois_confirme = False
     st.session_state.sous_page = 0
     st.session_state.bilan_enregistre = False
+    st.session_state.trous_ignores = set()
+    st.session_state.fichiers_combles = {}
 
 
 def obtenir_donnees_semaine(i: int, champ: str) -> list:
@@ -723,6 +785,8 @@ else:
             st.session_state.mois_confirme = False
             st.session_state.sous_page = 0
             st.session_state.bilan_enregistre = False
+            st.session_state.trous_ignores = set()
+            st.session_state.fichiers_combles = {}
 
         total_fichiers = len(fichiers)
 
@@ -775,7 +839,8 @@ else:
             st.stop()
 
         # ============================================================
-        # ÉTAPE 2 : confirmation du mois + détection des trous
+        # ÉTAPE 2 : confirmation du mois + détection des anomalies
+        # (doublons) + gestion interactive des périodes manquantes
         # ============================================================
         if not st.session_state.mois_confirme:
             st.divider()
@@ -818,27 +883,107 @@ else:
             if remarque.strip():
                 st.info("📝 Remarque notée : tu pourras corriger chaque date lors de la revue détaillée, rapport par rapport.")
 
-            trous = detecter_trous_hebdomadaires(st.session_state.lot_donnees)
-            poursuivre_malgre_trou = True
-            if trous:
-                for debut_trou, fin_trou in trous:
-                    st.warning(f"⚠️ La période du {debut_trou.strftime('%d/%m/%y')} au {fin_trou.strftime('%d/%m/%y')} manque.")
-                st.caption(
-                    "Si cette période manque vraiment, ferme cet écran, ajoute la photo correspondante "
-                    "à ton prochain lot de 5, puis relance l'analyse. Sinon, tu peux poursuivre quand même."
+            # --------------------------------------------------------
+            # 1) Détection d'anomalies : doublons (fichier ou période)
+            # --------------------------------------------------------
+            st.divider()
+            st.markdown("#### 🔎 Vérification des anomalies")
+            alertes_doublons = detecter_doublons(fichiers, st.session_state.lot_donnees)
+            doublons_bloquants = [a for a in alertes_doublons if a["gravite"] == "erreur"]
+
+            if alertes_doublons:
+                for alerte in alertes_doublons:
+                    if alerte["gravite"] == "erreur":
+                        st.error(f"🚨 {alerte['message']}")
+                    else:
+                        st.warning(f"⚠️ {alerte['message']}")
+            else:
+                st.success("✅ Aucun doublon détecté (fichiers et périodes tous distincts).")
+
+            poursuivre_malgre_doublon = True
+            if doublons_bloquants:
+                poursuivre_malgre_doublon = st.checkbox(
+                    "Je confirme que ce n'est pas une erreur : poursuivre quand même malgré le(s) doublon(s) ci-dessus.",
+                    key="confirmer_doublon",
                 )
-                poursuivre_malgre_trou = st.checkbox(
-                    "Poursuivre quand même malgré la/les période(s) manquante(s) ci-dessus."
+
+            # --------------------------------------------------------
+            # 2) Périodes manquantes : combler avec une photo, ou ignorer
+            # --------------------------------------------------------
+            st.divider()
+            st.markdown("#### 🗓️ Vérification des périodes manquantes")
+            trous = detecter_trous_hebdomadaires(st.session_state.lot_donnees)
+            trous_a_traiter = [
+                t for t in trous
+                if f"{t[0].isoformat()}_{t[1].isoformat()}" not in st.session_state.trous_ignores
+            ]
+
+            if trous_a_traiter:
+                for debut_trou, fin_trou in trous_a_traiter:
+                    cle_trou = f"{debut_trou.isoformat()}_{fin_trou.isoformat()}"
+                    st.warning(
+                        f"⚠️ La période du **{debut_trou.strftime('%d/%m/%y')}** au "
+                        f"**{fin_trou.strftime('%d/%m/%y')}** manque."
+                    )
+                    with st.expander(f"Gérer la période manquante du {debut_trou.strftime('%d/%m/%y')} au {fin_trou.strftime('%d/%m/%y')}"):
+                        fichier_combler = st.file_uploader(
+                            "Ajoute la photo de cette semaine si tu l'as (elle sera vérifiée automatiquement)",
+                            type=["jpg", "jpeg", "png"],
+                            key=f"upload_comblement_{cle_trou}",
+                        )
+                        col_verif, col_ignorer = st.columns(2)
+                        with col_verif:
+                            if st.button(
+                                "🔍 Vérifier et ajouter cette photo",
+                                key=f"verifier_comblement_{cle_trou}",
+                                disabled=fichier_combler is None,
+                                use_container_width=True,
+                            ):
+                                with st.spinner("Analyse de la photo ajoutée..."):
+                                    try:
+                                        api_key, _ = get_clients_config()
+                                        image_b64, mime_type = encoder_image(fichier_combler)
+                                        res_json = appeler_gemini(api_key, image_b64, mime_type)
+                                        donnees_comblees = extraire_donnees(res_json)
+                                        p = parser_periode(donnees_comblees.get("periode_hebdo", ""))
+                                        chevauche = p and not (p[1] < debut_trou or p[0] > fin_trou)
+                                        if chevauche:
+                                            st.session_state.lot_donnees.append(donnees_comblees)
+                                            st.session_state.fichiers_combles[cle_trou] = fichier_combler
+                                            st.success("✅ Photo ajoutée : elle correspond bien à la période manquante.")
+                                            st.rerun()
+                                        else:
+                                            periode_trouvee = donnees_comblees.get("periode_hebdo") or "non détectée"
+                                            st.error(
+                                                f"🚨 Cette photo couvre la période « {periode_trouvee} », qui ne "
+                                                f"correspond pas à la période manquante ({debut_trou.strftime('%d/%m/%y')} - "
+                                                f"{fin_trou.strftime('%d/%m/%y')}). Vérifie que c'est la bonne photo."
+                                            )
+                                    except Exception as e:
+                                        st.error(f"🚨 Erreur lors de l'analyse : {masquer_cle_api(str(e))}")
+                        with col_ignorer:
+                            if st.button(
+                                "⏭️ Enregistrer sans cette période",
+                                key=f"ignorer_comblement_{cle_trou}",
+                                use_container_width=True,
+                            ):
+                                st.session_state.trous_ignores.add(cle_trou)
+                                st.rerun()
+                st.caption(
+                    "Pour chaque période manquante ci-dessus : ajoute la photo correspondante (elle sera "
+                    "vérifiée automatiquement avant d'être intégrée), ou choisis d'enregistrer sans elle."
                 )
             else:
-                st.success("✅ Les 5 périodes hebdomadaires s'enchaînent sans trou détecté.")
+                st.success("✅ Aucune période manquante en attente (comblée ou ignorée).")
+
+            tous_les_trous_geres = len(trous_a_traiter) == 0
 
             col_go, col_retour = st.columns(2)
             with col_go:
                 if st.button(
                     "➡️ Continuer vers la vérification des rapports",
                     type="primary",
-                    disabled=not poursuivre_malgre_trou,
+                    disabled=not (tous_les_trous_geres and poursuivre_malgre_doublon),
                 ):
                     for cle in list(st.session_state.keys()):
                         if cle.startswith("editeur_recettes_") or cle.startswith("editeur_depenses_"):
@@ -859,6 +1004,8 @@ else:
             with col_retour:
                 if st.button("↩️ Recommencer l'analyse du lot"):
                     st.session_state.lot_donnees = None
+                    st.session_state.trous_ignores = set()
+                    st.session_state.fichiers_combles = {}
                     st.rerun()
             st.stop()
 
@@ -867,7 +1014,9 @@ else:
         # mois confirmé), puis le bilan mensuel consolidé
         # ============================================================
         debut_mois, fin_mois = determiner_bornes_mois(st.session_state.lot_donnees)
-        noms_pages = [f"Semaine {i + 1}" for i in range(total_fichiers)] + ["📊 Bilan mensuel"]
+        tous_les_fichiers = list(fichiers) + list(st.session_state.fichiers_combles.values())
+        nb_rapports_total = len(st.session_state.lot_donnees)
+        noms_pages = [f"Semaine {i + 1}" for i in range(nb_rapports_total)] + ["📊 Bilan mensuel"]
         nb_pages = len(noms_pages)
 
         st.divider()
@@ -895,15 +1044,15 @@ else:
         page_actuelle = st.session_state.sous_page
 
         # --------------------------------------------------------
-        # PAGES 0..4 : une semaine, filtrée sur le mois confirmé
+        # PAGES 0..N-1 : une semaine, filtrée sur le mois confirmé
         # --------------------------------------------------------
-        if page_actuelle < total_fichiers:
+        if page_actuelle < nb_rapports_total:
             i = page_actuelle
-            fichier_i = fichiers[i]
+            fichier_i = tous_les_fichiers[i]
             donnees_brutes = st.session_state.lot_donnees[i]
 
             st.divider()
-            st.subheader(f"📄 Semaine {i + 1} / {total_fichiers}")
+            st.subheader(f"📄 Semaine {i + 1} / {nb_rapports_total}")
 
             if "erreur" in donnees_brutes:
                 st.error(f"🚨 Ce rapport n'a pas pu être analysé : {donnees_brutes['erreur']}")
@@ -964,7 +1113,7 @@ else:
 
             recettes_combinees = []
             depenses_combinees = []
-            for i in range(total_fichiers):
+            for i in range(nb_rapports_total):
                 if "erreur" in st.session_state.lot_donnees[i]:
                     continue
                 recettes_combinees.extend(obtenir_donnees_semaine(i, "recettes"))
