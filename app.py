@@ -575,6 +575,10 @@ for cle, defaut in {
     "bilan_enregistre": False,
     "trous_ignores": set(),
     "fichiers_combles": {},
+    "photos_confirmees": False,
+    "page_confirmation": 0,
+    "fichiers_valides": set(),
+    "fichiers_remplaces": {},
 }.items():
     if cle not in st.session_state:
         st.session_state[cle] = defaut
@@ -598,6 +602,10 @@ def reinitialiser_lot() -> None:
     st.session_state.bilan_enregistre = False
     st.session_state.trous_ignores = set()
     st.session_state.fichiers_combles = {}
+    st.session_state.photos_confirmees = False
+    st.session_state.page_confirmation = 0
+    st.session_state.fichiers_valides = set()
+    st.session_state.fichiers_remplaces = {}
 
 
 def obtenir_donnees_semaine(i: int, champ: str) -> list:
@@ -787,21 +795,126 @@ else:
             st.session_state.bilan_enregistre = False
             st.session_state.trous_ignores = set()
             st.session_state.fichiers_combles = {}
+            st.session_state.photos_confirmees = False
+            st.session_state.page_confirmation = 0
+            st.session_state.fichiers_valides = set()
+            st.session_state.fichiers_remplaces = {}
 
         total_fichiers = len(fichiers)
+        fichiers_effectifs = [st.session_state.fichiers_remplaces.get(i, f) for i, f in enumerate(fichiers)]
 
         # ============================================================
-        # ÉTAPE 1 : analyse groupée des 5 rapports (Gemini)
+        # ÉTAPE 1 : confirmation visuelle des photos, une par page
+        # ============================================================
+        if not st.session_state.photos_confirmees:
+            st.divider()
+            st.subheader("🖼️ Étape 1 — Confirmation des photos")
+            st.caption(
+                "Vérifie chaque photo avant l'analyse : Semaine 1 doit être la plus ancienne, "
+                "Semaine 5 la plus récente. Ça évite de gaspiller une analyse sur la mauvaise image."
+            )
+
+            idx = st.session_state.page_confirmation
+            nb_validees = len(st.session_state.fichiers_valides)
+
+            st.progress(nb_validees / total_fichiers)
+            st.caption(f"{nb_validees} / {total_fichiers} photos confirmées")
+
+            nav1, nav2, nav3 = st.columns([1, 3, 1])
+            with nav1:
+                if st.button("◀ Précédent", disabled=idx == 0, use_container_width=True, key="nav_prec_confirm"):
+                    st.session_state.page_confirmation -= 1
+                    st.rerun()
+            with nav2:
+                choix_confirm = st.selectbox(
+                    "Aller à la photo",
+                    options=list(range(total_fichiers)),
+                    format_func=lambda i: f"Semaine {i + 1}" + (" ✅" if i in st.session_state.fichiers_valides else ""),
+                    index=idx,
+                    label_visibility="collapsed",
+                    key="select_nav_confirm",
+                )
+                if choix_confirm != idx:
+                    st.session_state.page_confirmation = choix_confirm
+                    st.rerun()
+            with nav3:
+                if st.button("Suivant ▶", disabled=idx == total_fichiers - 1, use_container_width=True, key="nav_suiv_confirm"):
+                    st.session_state.page_confirmation += 1
+                    st.rerun()
+
+            st.markdown(f"### Semaine {idx + 1} / {total_fichiers}")
+
+            col_g, col_img, col_d = st.columns([1, 3, 1])
+            with col_img:
+                st.image(fichiers_effectifs[idx], use_container_width=True)
+
+            est_validee = idx in st.session_state.fichiers_valides
+            affiche_remplacement = st.session_state.get(f"afficher_remplacement_{idx}", False)
+
+            if est_validee and not affiche_remplacement:
+                st.success("✅ Photo confirmée pour cette semaine.")
+                if st.button("🔄 Changer quand même cette photo", key=f"changer_{idx}"):
+                    st.session_state[f"afficher_remplacement_{idx}"] = True
+                    st.rerun()
+            elif not affiche_remplacement:
+                col_oui, col_non = st.columns(2)
+                with col_oui:
+                    if st.button("✅ Oui, c'est la bonne photo", type="primary", use_container_width=True, key=f"oui_{idx}"):
+                        st.session_state.fichiers_valides.add(idx)
+                        if idx < total_fichiers - 1:
+                            st.session_state.page_confirmation += 1
+                        st.rerun()
+                with col_non:
+                    if st.button("🔄 Non, remplacer cette photo", use_container_width=True, key=f"non_{idx}"):
+                        st.session_state[f"afficher_remplacement_{idx}"] = True
+                        st.rerun()
+
+            if affiche_remplacement:
+                nouveau_fichier = st.file_uploader(
+                    f"Charge la bonne photo pour la Semaine {idx + 1}",
+                    type=["jpg", "jpeg", "png"],
+                    key=f"remplacement_photo_{idx}",
+                )
+                if nouveau_fichier is not None:
+                    st.session_state.fichiers_remplaces[idx] = nouveau_fichier
+                    st.session_state.fichiers_valides.add(idx)
+                    st.session_state[f"afficher_remplacement_{idx}"] = False
+                    st.success("✅ Nouvelle photo enregistrée pour cette semaine.")
+                    if idx < total_fichiers - 1:
+                        st.session_state.page_confirmation += 1
+                    st.rerun()
+                if st.button("↩️ Annuler, garder la photo précédente", key=f"annuler_remplacement_{idx}"):
+                    st.session_state[f"afficher_remplacement_{idx}"] = False
+                    st.rerun()
+
+            st.divider()
+            if nb_validees == total_fichiers:
+                if st.button("🚀 Lancer l'analyse finale", type="primary", use_container_width=True):
+                    st.session_state.photos_confirmees = True
+                    st.rerun()
+            else:
+                st.button(
+                    "🚀 Lancer l'analyse finale",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=True,
+                    help="Confirme d'abord chacune des 5 photos ci-dessus.",
+                )
+            st.stop()
+
+        fichiers = fichiers_effectifs
+
+        # ============================================================
+        # ÉTAPE 2 : analyse groupée des 5 rapports (Gemini)
         # ============================================================
         if st.session_state.lot_donnees is None:
             st.divider()
-            st.subheader("🗓️ Étape 1 — Analyse du lot mensuel")
+            st.subheader("🗓️ Étape 2 — Analyse du lot mensuel")
             st.write("Les 5 rapports vont être lus par l'IA afin d'identifier le mois couvert, avant tout enregistrement.")
             st.caption(
                 f"Modèle utilisé : `{GEMINI_MODEL}`. Les 5 images sont envoyées avec quelques secondes "
                 "d'écart entre chacune pour rester dans les limites du palier gratuit Gemini."
             )
-            st.image(list(fichiers), caption=[f.name for f in fichiers], width=130)
 
             if st.button("🔍 Analyser le lot (5 rapports)", type="primary"):
                 with st.spinner("Analyse Gemini des 5 rapports en cours..."):
@@ -839,12 +952,12 @@ else:
             st.stop()
 
         # ============================================================
-        # ÉTAPE 2 : confirmation du mois + détection des anomalies
+        # ÉTAPE 3 : confirmation du mois + détection des anomalies
         # (doublons) + gestion interactive des périodes manquantes
         # ============================================================
         if not st.session_state.mois_confirme:
             st.divider()
-            st.subheader("🗓️ Étape 2 — Vérification du mois avant enregistrement")
+            st.subheader("🗓️ Étape 3 — Vérification du mois avant enregistrement")
 
             nb_erreurs = sum(1 for d in st.session_state.lot_donnees if "erreur" in d)
             if nb_erreurs:
@@ -1010,7 +1123,7 @@ else:
             st.stop()
 
         # ============================================================
-        # ÉTAPE 3 : pages navigables — une par semaine (filtrée sur le
+        # ÉTAPE 4 : pages navigables — une par semaine (filtrée sur le
         # mois confirmé), puis le bilan mensuel consolidé
         # ============================================================
         debut_mois, fin_mois = determiner_bornes_mois(st.session_state.lot_donnees)
