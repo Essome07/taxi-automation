@@ -24,11 +24,13 @@ import json
 import os
 import re
 import time
+import unicodedata
 
 import gspread
 import requests
 import streamlit as st
 from google.oauth2.service_account import Credentials
+from google.auth.transport.requests import AuthorizedSession
 
 # ============================================================
 # CONFIGURATION GÉNÉRALE
@@ -65,10 +67,28 @@ NOMS_MOIS = ["", "janvier", "février", "mars", "avril", "mai", "juin", "juillet
 MAX_IMAGES_PAR_LOT = 5
 
 # Feuille principale : une colonne par mois (mois + décalage), 3 lignes de bilan
+# Colonne D = janvier => colonne = numéro du mois + 3
 OFFSET_COLONNE_MOIS = 3
 LIGNE_RECETTES_MENSUEL = 4
 LIGNE_DEPENSES_MENSUEL = 5
 LIGNE_SOLDE_MENSUEL = 6
+
+# --- Onglet "Expenses" de la feuille du client ---
+# Structure observée : colonne A = nom de la rubrique, colonne C = intitulé du
+# poste de dépense, colonnes D+ = un mois chacune. Les lignes dont la colonne C
+# vaut "Monthly totals:" sont des lignes de TOTAUX (formules) : l'app ne doit
+# jamais écrire dedans.
+NOM_ONGLET_DEPENSES_DEFAUT = "Expenses"
+COL_RUBRIQUE_DEPENSES = 1   # A
+COL_POSTE_DEPENSES = 3      # C
+LIBELLE_TOTAUX_MENSUELS = "monthly totals"
+
+# Rubriques récurrentes (mois après mois) : privilégiées lors de l'appariement
+# automatique, au détriment des rubriques ponctuelles (achat du taxi, lancement).
+PRIORITE_RUBRIQUES = {
+    "depenses fixes": 0,
+    "depenses diverses": 1,
+}
 
 VALUE_INPUT_OPTION = "USER_ENTERED"  # évite que Sheets force les nombres en texte (bug de l'apostrophe)
 
@@ -79,6 +99,7 @@ VALUE_INPUT_OPTION = "USER_ENTERED"  # évite que Sheets force les nombres en te
 def charger_config() -> dict:
     defaut = {
         "sheet_principale_id": SHEET_PRINCIPALE_ID_DEFAUT,
+        "nom_onglet_depenses": NOM_ONGLET_DEPENSES_DEFAUT,
         "nom_utilisateur": "Pascal",
     }
     if os.path.exists(CONFIG_PATH):
@@ -125,15 +146,66 @@ def numero_colonne_vers_lettre(n: int) -> str:
 # ============================================================
 # CONNEXIONS (Google Sheets + clé Gemini)
 # ============================================================
+def charger_credentials():
+    """Charge les identifiants du compte de service, depuis le fichier local
+    en développement ou depuis les secrets Streamlit en production."""
+    if os.path.exists("credentials.json"):
+        return Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
+    return Credentials.from_service_account_info(st.secrets["google_credentials"], scopes=SCOPES)
+
+
 @st.cache_resource(show_spinner=False)
 def get_gspread_client():
     """Authentifie le compte de service Google - mis en cache car les
     identifiants ne changent jamais en cours de session."""
-    if os.path.exists("credentials.json"):
-        creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
-    else:
-        creds = Credentials.from_service_account_info(st.secrets["google_credentials"], scopes=SCOPES)
-    return gspread.authorize(creds)
+    return gspread.authorize(charger_credentials())
+
+
+def diagnostiquer_acces_feuille(sheet_id: str) -> dict:
+    """Vérifie, SANS RIEN MODIFIER, si le compte de service peut lire et
+    écrire dans le classeur du client.
+
+    On interroge l'API Drive plutôt que de tenter une écriture d'essai :
+    écrire puis annuler risquerait d'effacer une formule existante dans la
+    feuille d'un client. Drive renvoie directement le droit `canEdit`."""
+    session = AuthorizedSession(charger_credentials())
+    reponse = session.get(
+        f"https://www.googleapis.com/drive/v3/files/{sheet_id}",
+        params={"fields": "name,capabilities/canEdit", "supportsAllDrives": "true"},
+        timeout=30,
+    )
+
+    if reponse.status_code == 404:
+        return {
+            "statut": "introuvable",
+            "message": (
+                "Le classeur est introuvable pour le compte de service. Soit l'identifiant est "
+                "incorrect, soit la feuille n'a pas encore été partagée avec l'adresse ci-dessus."
+            ),
+        }
+    if reponse.status_code == 403:
+        return {
+            "statut": "refuse",
+            "message": "Accès refusé : la feuille n'est pas partagée avec le compte de service.",
+        }
+    if reponse.status_code != 200:
+        return {
+            "statut": "erreur",
+            "message": f"Réponse inattendue de Google Drive (code {reponse.status_code}).",
+        }
+
+    infos = reponse.json()
+    peut_editer = infos.get("capabilities", {}).get("canEdit", False)
+    return {
+        "statut": "editeur" if peut_editer else "lecture_seule",
+        "titre": infos.get("name", "(sans titre)"),
+        "message": (
+            "Le compte de service peut lire ET modifier ce classeur."
+            if peut_editer
+            else "Le compte de service peut lire ce classeur, mais PAS y écrire : "
+                 "le partage est en « Lecteur » au lieu de « Éditeur »."
+        ),
+    }
 
 
 def get_clients(sheet_principale_id: str):
@@ -152,6 +224,22 @@ def get_clients_config():
     """Raccourci qui lit l'identifiant depuis la config utilisateur en session."""
     config = st.session_state.config
     return get_clients(config["sheet_principale_id"])
+
+
+def get_onglet(nom_onglet: str):
+    """Ouvre un onglet précis (par son nom) du classeur du client.
+    Lève une erreur explicite si l'onglet n'existe pas, plutôt que l'erreur
+    gspread brute peu compréhensible pour l'utilisateur."""
+    gc = get_gspread_client()
+    classeur = gc.open_by_key(st.session_state.config["sheet_principale_id"])
+    try:
+        return classeur.worksheet(nom_onglet)
+    except gspread.WorksheetNotFound:
+        onglets = ", ".join(f"« {f.title} »" for f in classeur.worksheets())
+        raise RuntimeError(
+            f"L'onglet « {nom_onglet} » est introuvable dans le classeur du client. "
+            f"Onglets disponibles : {onglets}. Corrige le nom dans ⚙️ Paramètres."
+        )
 
 
 # ============================================================
@@ -622,6 +710,140 @@ def enregistrer_bilan_mensuel(feuille_principale, rapport: dict) -> None:
 
 
 # ============================================================
+# ONGLET "EXPENSES" DE LA FEUILLE DU CLIENT
+# Lecture de la structure existante, appariement des dépenses du
+# bilan avec les postes déjà présents, puis écriture ciblée.
+# ============================================================
+def message_erreur_sheets(exc: Exception) -> str:
+    """Traduit les erreurs Google Sheets courantes en consignes actionnables,
+    plutôt que de laisser remonter un code HTTP brut."""
+    texte = str(exc)
+    email_service = obtenir_email_service_account()
+
+    if "403" in texte or "PERMISSION_DENIED" in texte or "permission" in texte.lower():
+        return (
+            "Accès refusé par Google : le compte de service n'a pas le droit d'écrire dans "
+            f"cette feuille. Demande au client de la partager avec « {email_service} » "
+            "en rôle **Éditeur**, puis relance l'opération."
+        )
+    if "404" in texte or "not found" in texte.lower():
+        return (
+            "Classeur ou onglet introuvable. Vérifie l'identifiant du classeur et le nom de "
+            "l'onglet dans ⚙️ Paramètres, et que la feuille est bien partagée avec "
+            f"« {email_service} »."
+        )
+    if "429" in texte or "quota" in texte.lower():
+        return (
+            "Trop de requêtes envoyées à Google Sheets en peu de temps. Patiente une minute "
+            "puis réessaie."
+        )
+    return texte
+
+
+def normaliser_libelle(texte: str) -> str:
+    """Minuscules, sans accents, sans ponctuation : permet de rapprocher
+    « Vidange » (feuille du client) de « vidange » ou « VIDANGE » (lu par l'IA
+    sur un rapport manuscrit)."""
+    texte = unicodedata.normalize("NFD", str(texte or ""))
+    texte = "".join(c for c in texte if unicodedata.category(c) != "Mn")
+    return re.sub(r"[^a-z0-9]+", " ", texte.lower()).strip()
+
+
+def lire_structure_depenses(feuille) -> dict:
+    """Analyse l'onglet Expenses et en extrait la structure réelle :
+    les rubriques (colonne A) et, pour chacune, la liste des postes de
+    dépense (colonne C) avec leur numéro de ligne.
+    Les lignes « Monthly totals: » servent de séparateurs de rubrique et
+    sont exclues des destinations possibles (ce sont des formules)."""
+    valeurs = feuille.get_all_values()
+    rubriques = []
+    rubrique_courante = None
+
+    for numero_ligne, ligne in enumerate(valeurs, start=1):
+        col_a = ligne[COL_RUBRIQUE_DEPENSES - 1].strip() if len(ligne) >= COL_RUBRIQUE_DEPENSES else ""
+        col_c = ligne[COL_POSTE_DEPENSES - 1].strip() if len(ligne) >= COL_POSTE_DEPENSES else ""
+
+        if normaliser_libelle(col_c).startswith(LIBELLE_TOTAUX_MENSUELS):
+            rubrique_courante = {
+                "nom": col_a or f"Rubrique (ligne {numero_ligne})",
+                "ligne_totaux": numero_ligne,
+                "postes": [],
+            }
+            rubriques.append(rubrique_courante)
+        elif col_c and rubrique_courante is not None:
+            rubrique_courante["postes"].append({"ligne": numero_ligne, "nom": col_c})
+
+    return {"rubriques": rubriques, "valeurs": valeurs}
+
+
+def lister_postes(structure: dict) -> list:
+    """Aplatit la structure en une liste de destinations possibles."""
+    postes = []
+    for rubrique in structure["rubriques"]:
+        for poste in rubrique["postes"]:
+            postes.append({
+                "ligne": poste["ligne"],
+                "nom": poste["nom"],
+                "rubrique": rubrique["nom"],
+            })
+    return postes
+
+
+def priorite_rubrique(nom_rubrique: str) -> int:
+    return PRIORITE_RUBRIQUES.get(normaliser_libelle(nom_rubrique), 9)
+
+
+def trouver_appariement_auto(titre_depense: str, postes: list):
+    """Propose la ligne la plus plausible pour une dépense du bilan.
+    En cas d'homonymes dans plusieurs rubriques (ex. « Assurance » existe à la
+    fois en dépenses de lancement et en dépenses fixes), on privilégie les
+    rubriques récurrentes. Renvoie None si rien de convaincant."""
+    cible = normaliser_libelle(titre_depense)
+    if not cible:
+        return None
+
+    exacts = [p for p in postes if normaliser_libelle(p["nom"]) == cible]
+    if exacts:
+        return min(exacts, key=lambda p: priorite_rubrique(p["rubrique"]))
+
+    partiels = [
+        p for p in postes
+        if cible in normaliser_libelle(p["nom"]) or normaliser_libelle(p["nom"]) in cible
+    ]
+    if partiels:
+        return min(
+            partiels,
+            key=lambda p: (priorite_rubrique(p["rubrique"]), len(normaliser_libelle(p["nom"]))),
+        )
+
+    return None
+
+
+def valeur_actuelle_cellule(structure: dict, ligne: int, mois: int) -> str:
+    """Contenu actuellement affiché dans la cellule visée (pour prévenir
+    l'utilisateur qu'une écriture va écraser une valeur existante)."""
+    colonne = mois + OFFSET_COLONNE_MOIS
+    valeurs = structure["valeurs"]
+    if ligne - 1 < len(valeurs):
+        ligne_valeurs = valeurs[ligne - 1]
+        if colonne - 1 < len(ligne_valeurs):
+            return ligne_valeurs[colonne - 1].strip()
+    return ""
+
+
+def ecrire_depenses_client(feuille, montants_par_ligne: dict, mois: int) -> None:
+    """Écrit, en une seule requête, les montants dans la colonne du mois.
+    montants_par_ligne : {numero_de_ligne: montant}."""
+    lettre_col = numero_colonne_vers_lettre(mois + OFFSET_COLONNE_MOIS)
+    donnees = [
+        {"range": f"{lettre_col}{ligne}", "values": [[montant]]}
+        for ligne, montant in sorted(montants_par_ligne.items())
+    ]
+    if donnees:
+        feuille.batch_update(donnees, value_input_option=VALUE_INPUT_OPTION)
+
+
+# ============================================================
 # ÉTAT DE SESSION
 # ============================================================
 for cle, defaut in {
@@ -636,12 +858,14 @@ for cle, defaut in {
     "bilan_enregistre": False,
     "trous_ignores": set(),
     "fichiers_combles": {},
-    "photos_confirmees": False,
-    "page_confirmation": 0,
-    "fichiers_valides": set(),
-    "fichiers_remplaces": {},
     "ordre_chronologique": None,
     "ordre_upload_estime": None,
+    "structure_depenses": None,
+    "depenses_ecrites": False,
+    "semaines_validees": set(),
+    "bilan_etabli": False,
+    "rapport_fige": None,
+    "donnees_editees": {},
 }.items():
     if cle not in st.session_state:
         st.session_state[cle] = defaut
@@ -665,25 +889,65 @@ def reinitialiser_lot() -> None:
     st.session_state.bilan_enregistre = False
     st.session_state.trous_ignores = set()
     st.session_state.fichiers_combles = {}
-    st.session_state.photos_confirmees = False
-    st.session_state.page_confirmation = 0
-    st.session_state.fichiers_valides = set()
-    st.session_state.fichiers_remplaces = {}
     st.session_state.ordre_chronologique = None
     st.session_state.ordre_upload_estime = None
+    st.session_state.structure_depenses = None
+    st.session_state.depenses_ecrites = False
+    st.session_state.semaines_validees = set()
+    st.session_state.bilan_etabli = False
+    st.session_state.rapport_fige = None
+    st.session_state.donnees_editees = {}
+    for cle in list(st.session_state.keys()):
+        if cle.startswith("dest_depense_"):
+            del st.session_state[cle]
 
 
-def obtenir_donnees_semaine(i: int, champ: str) -> list:
-    """Renvoie les données (recettes/dépenses) éditées par l'utilisateur pour
-    la semaine i si la page a déjà été ouverte (donc le data_editor a déjà
-    été instancié), sinon les données filtrées par défaut (non éditées)."""
-    cle_widget = f"editeur_{champ}_{i}"
-    if cle_widget in st.session_state:
-        return st.session_state[cle_widget]
+def normaliser_lignes_editeur(valeur) -> list:
+    """Convertit ce que renvoie st.data_editor en une liste de dictionnaires.
+    Selon le type d'entrée, Streamlit renvoie un DataFrame ou une liste : on
+    normalise pour que le reste du code manipule toujours des dictionnaires."""
+    if valeur is None:
+        return []
+    if hasattr(valeur, "to_dict"):  # DataFrame
+        return valeur.to_dict("records")
+    return list(valeur)
+
+
+def memoriser_donnees_semaine(i: int, recettes, depenses) -> None:
+    """Mémorise les données RÉELLEMENT affichées/éditées pour la semaine i.
+
+    Indispensable : pour un st.data_editor, st.session_state[cle] ne contient
+    que le journal des modifications (lignes ajoutées/modifiées/supprimées),
+    et non les données résultantes. Sans cette mémorisation, les corrections
+    manuelles ne seraient pas reprises dans le bilan mensuel."""
+    st.session_state.donnees_editees[i] = {
+        "recettes": normaliser_lignes_editeur(recettes),
+        "depenses": normaliser_lignes_editeur(depenses),
+    }
+
+
+def donnees_initiales_semaine(i: int, champ: str) -> list:
+    """Valeur de DÉPART du tableau éditable : toujours les données brutes
+    issues de l'analyse, jamais les données déjà éditées.
+
+    C'est volontaire : st.data_editor applique ses modifications par-dessus la
+    valeur qu'on lui fournit. Si on lui redonnait le résultat déjà modifié, une
+    ligne ajoutée par l'utilisateur serait réappliquée à chaque rechargement et
+    se dupliquerait indéfiniment. En gardant une base fixe, l'affichage reste
+    exact et les corrections sont conservées via l'état interne du widget."""
     if st.session_state.donnees_filtrees and i in st.session_state.donnees_filtrees:
         return st.session_state.donnees_filtrees[i][champ]
     return []
 
+
+def obtenir_donnees_semaine(i: int, champ: str) -> list:
+    """Renvoie les données de la semaine i telles qu'elles serviront au bilan :
+    la version corrigée par l'utilisateur si la page a déjà été ouverte, sinon
+    les données issues de l'analyse (non modifiées)."""
+    editees = st.session_state.donnees_editees.get(i)
+    if editees is not None:
+        return editees[champ]
+    return donnees_initiales_semaine(i, champ)
 
 
 def afficher_bilan_mensuel(rapport: dict) -> None:
@@ -737,9 +1001,12 @@ with st.sidebar:
     )
     st.divider()
 
-    st.caption("📧 Compte de service Google connecté :")
+    st.caption("📧 Compte de service Google de l'app :")
     st.code(obtenir_email_service_account(), language=None)
-    st.caption("Partage tes fichiers Google Sheets avec cette adresse (rôle **Éditeur**) pour que l'app puisse les modifier.")
+    st.caption(
+        "C'est avec cette identité que l'app accède aux fichiers. Le client doit partager "
+        "sa feuille avec cette adresse en rôle **Éditeur** (détails dans ⚙️ Paramètres)."
+    )
 
 
 # ============================================================
@@ -751,34 +1018,93 @@ if st.session_state.page == "⚙️ Paramètres":
     st.subheader("Préférences")
     nouveau_nom = st.text_input("Ton prénom (utilisé dans la salutation)", value=st.session_state.config["nom_utilisateur"])
 
-    st.subheader("Fichier Google Sheets")
+    st.subheader("Fichier Google Sheets du client")
     st.caption(
-        "Colle l'URL complète du fichier Google Sheets, ou juste son identifiant "
-        "(la partie entre `/d/` et `/edit` dans l'URL). C'est la feuille où sont "
-        "enregistrés les bilans mensuels (recettes/dépenses/solde), une colonne par mois."
+        "Colle l'URL complète du fichier Google Sheets partagé par le client, ou juste "
+        "son identifiant (la partie entre `/d/` et `/edit` dans l'URL). Pense à vérifier "
+        "que le compte de service ci-contre y a bien un accès en écriture."
     )
     nouveau_principale = st.text_input(
-        "Feuille principale (bilans mensuels)",
+        "Classeur du client",
         value=st.session_state.config["sheet_principale_id"],
+    )
+    nouvel_onglet_depenses = st.text_input(
+        "Nom de l'onglet des dépenses",
+        value=st.session_state.config.get("nom_onglet_depenses", NOM_ONGLET_DEPENSES_DEFAUT),
+        help="Doit correspondre exactement au nom de l'onglet dans Google Sheets (majuscules comprises).",
     )
 
     if st.button("💾 Enregistrer les paramètres", type="primary"):
         st.session_state.config = {
             "nom_utilisateur": nouveau_nom.strip() or "Pascal",
             "sheet_principale_id": extraire_id_depuis_url(nouveau_principale),
+            "nom_onglet_depenses": nouvel_onglet_depenses.strip() or NOM_ONGLET_DEPENSES_DEFAUT,
         }
         sauvegarder_config(st.session_state.config)
+        st.session_state.structure_depenses = None
         st.success("✅ Paramètres enregistrés. Ils seront utilisés pour tous les prochains rapports.")
 
     st.divider()
-    st.subheader("Test de connexion")
-    if st.button("🔌 Vérifier la connexion au fichier configuré"):
-        with st.spinner("Connexion en cours..."):
+    st.subheader("🔐 Accès à la feuille du client")
+    email_service = obtenir_email_service_account()
+    st.write(
+        "L'application ne se connecte pas avec ton compte Google personnel, mais avec un "
+        "**compte de service** : une identité Google dédiée au robot. Pour qu'elle puisse "
+        "écrire dans la feuille, le client doit la partager avec cette adresse, "
+        "exactement comme il partagerait avec un collègue."
+    )
+    st.code(email_service, language=None)
+
+    with st.expander("📋 Marche à suivre à envoyer au client"):
+        st.markdown(
+            f"""
+1. Ouvrir le fichier Google Sheets.
+2. Cliquer sur **Partager** (en haut à droite).
+3. Coller cette adresse dans le champ des destinataires :
+   `{email_service}`
+4. Choisir le rôle **Éditeur** (et non « Lecteur »).
+5. Décocher « Envoyer une notification » si proposé, puis cliquer sur **Envoyer**.
+"""
+        )
+        st.caption(
+            "Un partage « Tout utilisateur disposant du lien » fonctionne aussi, mais rend le "
+            "fichier accessible à quiconque possède l'URL : le partage nominatif ci-dessus est "
+            "nettement plus sûr pour les données financières du client."
+        )
+
+    if st.button("🔌 Vérifier l'accès et la structure du classeur", type="primary"):
+        with st.spinner("Vérification en cours..."):
+            sheet_id = st.session_state.config["sheet_principale_id"]
             try:
-                _, feuille_principale = get_clients_config()
-                st.success(f"✅ Connecté avec succès à la feuille principale « {feuille_principale.spreadsheet.title} ».")
+                diagnostic = diagnostiquer_acces_feuille(sheet_id)
             except Exception as e:
-                st.error(f"🚨 Connexion impossible : {e}")
+                diagnostic = {"statut": "erreur", "message": str(e)}
+
+            if diagnostic["statut"] == "editeur":
+                st.success(f"✅ Classeur « {diagnostic['titre']} » : accès en écriture confirmé.")
+            elif diagnostic["statut"] == "lecture_seule":
+                st.error(f"🚨 {diagnostic['message']}")
+                st.info("Demande au client de repasser le partage de « Lecteur » à « Éditeur ».")
+            else:
+                st.error(f"🚨 {diagnostic['message']}")
+                st.info("Vérifie l'identifiant du classeur ci-dessus, puis le partage avec le compte de service.")
+
+            if diagnostic["statut"] in ("editeur", "lecture_seule"):
+                try:
+                    classeur = get_gspread_client().open_by_key(sheet_id)
+                    titres = [f.title for f in classeur.worksheets()]
+                    st.write("**Onglets trouvés :** " + ", ".join(f"`{t}`" for t in titres))
+
+                    onglet_attendu = st.session_state.config.get("nom_onglet_depenses", NOM_ONGLET_DEPENSES_DEFAUT)
+                    if onglet_attendu in titres:
+                        st.success(f"✅ L'onglet des dépenses « {onglet_attendu} » est bien présent.")
+                    else:
+                        st.error(
+                            f"🚨 L'onglet des dépenses « {onglet_attendu} » est introuvable. "
+                            "Corrige son nom ci-dessus (orthographe et majuscules doivent correspondre exactement)."
+                        )
+                except Exception as e:
+                    st.error(f"🚨 Lecture des onglets impossible : {message_erreur_sheets(e)}")
 
     st.divider()
     st.subheader("Quelle clé Gemini l'app utilise-t-elle réellement ?")
@@ -860,120 +1186,17 @@ else:
             st.session_state.bilan_enregistre = False
             st.session_state.trous_ignores = set()
             st.session_state.fichiers_combles = {}
-            st.session_state.photos_confirmees = False
-            st.session_state.page_confirmation = 0
-            st.session_state.fichiers_valides = set()
-            st.session_state.fichiers_remplaces = {}
             st.session_state.ordre_chronologique = None
             st.session_state.ordre_upload_estime = estimer_ordre_upload(fichiers)
+            st.session_state.semaines_validees = set()
+            st.session_state.bilan_etabli = False
+            st.session_state.rapport_fige = None
+            st.session_state.donnees_editees = {}
+            st.session_state.structure_depenses = None
+            st.session_state.depenses_ecrites = False
 
         total_fichiers = len(fichiers)
-        fichiers_pre_triees = [fichiers[j] for j in st.session_state.ordre_upload_estime]
-        fichiers_effectifs = [st.session_state.fichiers_remplaces.get(i, f) for i, f in enumerate(fichiers_pre_triees)]
-
-        # ============================================================
-        # ÉTAPE 1 : confirmation visuelle des photos, une par page
-        # ============================================================
-        if not st.session_state.photos_confirmees:
-            st.divider()
-            st.subheader("🖼️ Étape 1 — Confirmation des photos")
-            st.caption(
-                "Vérifie que chaque photo est bien lisible et correspond à un rapport hebdomadaire distinct. "
-                "Elles sont déjà pré-triées par date de capture, mais ce classement n'est qu'indicatif : "
-                "l'ordre chronologique définitif (Semaine 1 à 5) sera déterminé automatiquement d'après les "
-                "dates lues sur chaque photo, lors de l'analyse."
-            )
-
-            idx = st.session_state.page_confirmation
-            nb_validees = len(st.session_state.fichiers_valides)
-
-            st.progress(nb_validees / total_fichiers)
-            st.caption(f"{nb_validees} / {total_fichiers} photos confirmées")
-
-            nav1, nav2, nav3 = st.columns([1, 3, 1])
-            with nav1:
-                if st.button("◀ Précédent", disabled=idx == 0, use_container_width=True, key="nav_prec_confirm"):
-                    st.session_state.page_confirmation = idx - 1
-                    st.rerun()
-            with nav2:
-                # Clé dynamique (inclut idx) : le widget se recrée à chaque
-                # changement de page et respecte alors 'index=', au lieu de
-                # garder un état figé qui écraserait la navigation par boutons.
-                choix_confirm = st.selectbox(
-                    "Aller à la photo",
-                    options=list(range(total_fichiers)),
-                    format_func=lambda i: f"Photo {i + 1}" + (" ✅" if i in st.session_state.fichiers_valides else ""),
-                    index=idx,
-                    label_visibility="collapsed",
-                    key=f"select_nav_confirm_{idx}",
-                )
-                if choix_confirm != idx:
-                    st.session_state.page_confirmation = choix_confirm
-                    st.rerun()
-            with nav3:
-                if st.button("Suivant ▶", disabled=idx == total_fichiers - 1, use_container_width=True, key="nav_suiv_confirm"):
-                    st.session_state.page_confirmation = idx + 1
-                    st.rerun()
-
-            st.markdown(f"### Photo {idx + 1} / {total_fichiers}")
-
-            col_g, col_img, col_d = st.columns([1, 3, 1])
-            with col_img:
-                st.image(fichiers_effectifs[idx], use_container_width=True)
-
-            est_validee = idx in st.session_state.fichiers_valides
-            affiche_remplacement = st.session_state.get(f"afficher_remplacement_{idx}", False)
-
-            if est_validee and not affiche_remplacement:
-                st.success("✅ Photo confirmée pour cette semaine.")
-                if st.button("🔄 Changer quand même cette photo", key=f"changer_{idx}"):
-                    st.session_state[f"afficher_remplacement_{idx}"] = True
-                    st.rerun()
-            elif not affiche_remplacement:
-                col_oui, col_non = st.columns(2)
-                with col_oui:
-                    if st.button("✅ Oui, c'est la bonne photo", type="primary", use_container_width=True, key=f"oui_{idx}"):
-                        st.session_state.fichiers_valides.add(idx)
-                        if idx < total_fichiers - 1:
-                            st.session_state.page_confirmation = idx + 1
-                        st.rerun()
-                with col_non:
-                    if st.button("🔄 Non, remplacer cette photo", use_container_width=True, key=f"non_{idx}"):
-                        st.session_state[f"afficher_remplacement_{idx}"] = True
-                        st.rerun()
-
-            if affiche_remplacement:
-                nouveau_fichier = st.file_uploader(
-                    f"Charge la bonne photo pour cet emplacement (Photo {idx + 1})",
-                    type=["jpg", "jpeg", "png"],
-                    key=f"remplacement_photo_{idx}",
-                )
-                if nouveau_fichier is not None:
-                    st.session_state.fichiers_remplaces[idx] = nouveau_fichier
-                    st.session_state.fichiers_valides.add(idx)
-                    st.session_state[f"afficher_remplacement_{idx}"] = False
-                    st.success("✅ Nouvelle photo enregistrée pour cette semaine.")
-                    if idx < total_fichiers - 1:
-                        st.session_state.page_confirmation = idx + 1
-                    st.rerun()
-                if st.button("↩️ Annuler, garder la photo précédente", key=f"annuler_remplacement_{idx}"):
-                    st.session_state[f"afficher_remplacement_{idx}"] = False
-                    st.rerun()
-
-            st.divider()
-            if nb_validees == total_fichiers:
-                if st.button("🚀 Lancer l'analyse finale", type="primary", use_container_width=True):
-                    st.session_state.photos_confirmees = True
-                    st.rerun()
-            else:
-                st.button(
-                    "🚀 Lancer l'analyse finale",
-                    type="primary",
-                    use_container_width=True,
-                    disabled=True,
-                    help="Confirme d'abord chacune des 5 photos ci-dessus.",
-                )
-            st.stop()
+        fichiers_effectifs = [fichiers[j] for j in st.session_state.ordre_upload_estime]
 
         if st.session_state.lot_donnees is not None:
             # L'analyse a déjà eu lieu : on retrouve les fichiers dans l'ordre
@@ -985,11 +1208,11 @@ else:
             fichiers = fichiers_effectifs
 
         # ============================================================
-        # ÉTAPE 2 : analyse groupée des 5 rapports (Gemini)
+        # ÉTAPE 1 : analyse groupée des 5 rapports (Gemini)
         # ============================================================
         if st.session_state.lot_donnees is None:
             st.divider()
-            st.subheader("🗓️ Étape 2 — Analyse du lot mensuel")
+            st.subheader("🗓️ Étape 1 — Analyse du lot mensuel")
             st.write("Les 5 rapports vont être lus par l'IA afin d'identifier le mois couvert, avant tout enregistrement.")
             st.caption(
                 f"Modèle utilisé : `{GEMINI_MODEL}`. Les 5 images sont envoyées avec quelques secondes "
@@ -1035,12 +1258,12 @@ else:
             st.stop()
 
         # ============================================================
-        # ÉTAPE 3 : confirmation du mois + détection des anomalies
+        # ÉTAPE 2 : confirmation du mois + détection des anomalies
         # (doublons) + gestion interactive des périodes manquantes
         # ============================================================
         if not st.session_state.mois_confirme:
             st.divider()
-            st.subheader("🗓️ Étape 3 — Vérification du mois avant enregistrement")
+            st.subheader("🗓️ Étape 2 — Vérification du mois avant enregistrement")
 
             nb_erreurs = sum(1 for d in st.session_state.lot_donnees if "erreur" in d)
             if nb_erreurs:
@@ -1208,13 +1431,19 @@ else:
             st.stop()
 
         # ============================================================
-        # ÉTAPE 4 : pages navigables — une par semaine (filtrée sur le
+        # ÉTAPE 3 : pages navigables — une par semaine (filtrée sur le
         # mois confirmé), puis le bilan mensuel consolidé
         # ============================================================
         debut_mois, fin_mois = determiner_bornes_mois(st.session_state.lot_donnees)
         tous_les_fichiers = list(fichiers)
         nb_rapports_total = len(st.session_state.lot_donnees)
-        noms_pages = [f"Semaine {i + 1}" for i in range(nb_rapports_total)] + ["📊 Bilan mensuel"]
+
+        def libelle_semaine(i: int) -> str:
+            if "erreur" in st.session_state.lot_donnees[i]:
+                return f"Semaine {i + 1} ⚠️"
+            return f"Semaine {i + 1}" + (" ✅" if i in st.session_state.semaines_validees else "")
+
+        noms_pages = [libelle_semaine(i) for i in range(nb_rapports_total)] + ["📊 Bilan mensuel"]
         nb_pages = len(noms_pages)
 
         st.divider()
@@ -1255,12 +1484,22 @@ else:
             donnees_brutes = st.session_state.lot_donnees[i]
 
             st.divider()
-            st.subheader(f"📄 Semaine {i + 1} / {nb_rapports_total}")
+            st.subheader(f"📄 Étape 3 — Vérification : Semaine {i + 1} / {nb_rapports_total}")
 
             if "erreur" in donnees_brutes:
                 st.error(f"🚨 Ce rapport n'a pas pu être analysé : {donnees_brutes['erreur']}")
                 st.caption("Il est exclu du bilan mensuel. Tu peux relancer l'analyse du lot si besoin (bouton à l'étape précédente).")
             else:
+                semaine_validee = i in st.session_state.semaines_validees
+
+                if st.session_state.bilan_etabli:
+                    st.info(
+                        "🔒 Le bilan mensuel a déjà été établi : les données sont figées. "
+                        "Pour les modifier, utilise « Reprendre les modifications » sur la page 📊 Bilan mensuel."
+                    )
+                elif semaine_validee:
+                    st.success("✅ Semaine validée — les données ci-dessous sont prêtes pour le bilan.")
+
                 col_img, col_data = st.columns([1, 1.4])
                 with col_img:
                     st.image(fichier_i, caption=fichier_i.name, use_container_width=True)
@@ -1271,22 +1510,29 @@ else:
                         f"Seuls les jours du mois confirmé ({debut_mois.strftime('%d/%m/%y')} - "
                         f"{fin_mois.strftime('%d/%m/%y')}) sont pris en compte ci-dessous."
                     )
+                    st.caption(
+                        "🖊️ Corrige librement ce que l'IA a mal lu : tu peux modifier une date ou un "
+                        "montant, ajouter une ligne oubliée, ou supprimer une ligne en trop."
+                    )
+
+                    lecture_seule = st.session_state.bilan_etabli
 
                     st.write("**Recettes journalières (mois confirmé uniquement)**")
                     recettes_editees = st.data_editor(
-                        obtenir_donnees_semaine(i, "recettes"),
+                        donnees_initiales_semaine(i, "recettes"),
                         num_rows="dynamic",
                         column_config={
                             "date": st.column_config.TextColumn("Date (JJ/MM/AA)", required=True),
                             "montant": st.column_config.NumberColumn("Montant (FCFA)", required=True, step=500),
                         },
                         use_container_width=True,
+                        disabled=lecture_seule,
                         key=f"editeur_recettes_{i}",
                     )
 
                     st.write("**Dépenses (mois confirmé uniquement)**")
                     depenses_editees = st.data_editor(
-                        obtenir_donnees_semaine(i, "depenses"),
+                        donnees_initiales_semaine(i, "depenses"),
                         num_rows="dynamic",
                         column_config={
                             "titre": st.column_config.TextColumn("Titre de la dépense", required=True),
@@ -1294,8 +1540,13 @@ else:
                             "date": st.column_config.TextColumn("Date (JJ/MM/AA)", required=False),
                         },
                         use_container_width=True,
+                        disabled=lecture_seule,
                         key=f"editeur_depenses_{i}",
                     )
+
+                recettes_editees = normaliser_lignes_editeur(recettes_editees)
+                depenses_editees = normaliser_lignes_editeur(depenses_editees)
+                memoriser_donnees_semaine(i, recettes_editees, depenses_editees)
 
                 if not recettes_editees:
                     st.info("ℹ️ Aucun jour de cette semaine n'appartient au mois confirmé.")
@@ -1308,39 +1559,293 @@ else:
                 m2.metric("Dépenses (mois confirmé)", f"{formater_montant(total_d)} FCFA")
                 m3.metric("Solde", f"{formater_montant(total_r - total_d)} FCFA")
 
+                if not st.session_state.bilan_etabli:
+                    st.divider()
+                    if semaine_validee:
+                        if st.button("🖊️ Modifier à nouveau cette semaine", key=f"devalider_{i}", use_container_width=True):
+                            st.session_state.semaines_validees.discard(i)
+                            st.rerun()
+                    else:
+                        if st.button(
+                            "✅ Valider cette semaine (aucune modification à apporter)",
+                            type="primary",
+                            use_container_width=True,
+                            key=f"valider_semaine_{i}",
+                        ):
+                            st.session_state.semaines_validees.add(i)
+                            if i < nb_rapports_total - 1:
+                                st.session_state.sous_page = i + 1
+                            else:
+                                st.session_state.sous_page = nb_pages - 1
+                            st.rerun()
+
         # --------------------------------------------------------
         # PAGE FINALE : bilan mensuel consolidé + enregistrement
         # --------------------------------------------------------
         else:
             st.divider()
 
-            recettes_combinees = []
-            depenses_combinees = []
-            for i in range(nb_rapports_total):
-                if "erreur" in st.session_state.lot_donnees[i]:
-                    continue
-                recettes_combinees.extend(obtenir_donnees_semaine(i, "recettes"))
-                depenses_combinees.extend(obtenir_donnees_semaine(i, "depenses"))
+            indices_exploitables = [
+                i for i in range(nb_rapports_total)
+                if "erreur" not in st.session_state.lot_donnees[i]
+            ]
+            non_validees = [i for i in indices_exploitables if i not in st.session_state.semaines_validees]
 
-            rapport = calculer_bilan_mensuel_agrege(
-                recettes_combinees, depenses_combinees, debut_mois.year, debut_mois.month
-            )
+            # ====================================================
+            # PORTE DE CONFIRMATION : tant que l'utilisateur n'a pas
+            # confirmé ses modifications, aucun bilan n'est établi.
+            # ====================================================
+            if not st.session_state.bilan_etabli:
+                st.subheader("🧮 Étape 4 — Établir le bilan mensuel")
+                st.write(
+                    "Le bilan n'est pas encore calculé : il le sera à partir des données que tu "
+                    "auras validées, corrections comprises."
+                )
+
+                st.markdown("**État de la vérification, semaine par semaine :**")
+                etat_semaines = []
+                for i in range(nb_rapports_total):
+                    if "erreur" in st.session_state.lot_donnees[i]:
+                        statut = "⚠️ Non analysée (exclue du bilan)"
+                    elif i in st.session_state.semaines_validees:
+                        statut = "✅ Validée"
+                    else:
+                        statut = "⏳ En attente de vérification"
+                    etat_semaines.append({"Semaine": f"Semaine {i + 1}", "État": statut})
+                st.table(etat_semaines)
+
+                if non_validees:
+                    liste = ", ".join(f"Semaine {i + 1}" for i in non_validees)
+                    st.warning(
+                        f"⏳ Il reste à vérifier : {liste}. Ouvre chaque semaine pour corriger si "
+                        "nécessaire, puis valide-la."
+                    )
+                    if st.button("⏭️ Aller à la première semaine à vérifier", use_container_width=True):
+                        st.session_state.sous_page = non_validees[0]
+                        st.rerun()
+                    st.caption(
+                        "Si tu as déjà tout relu et qu'aucune correction n'est nécessaire, tu peux "
+                        "tout valider d'un coup ci-dessous."
+                    )
+                    if st.button("✅ Tout valider sans modification", use_container_width=True):
+                        st.session_state.semaines_validees = set(indices_exploitables)
+                        st.rerun()
+                else:
+                    st.success("✅ Toutes les semaines exploitables ont été vérifiées et validées.")
+
+                st.divider()
+                if st.button(
+                    "🚀 Lancer l'analyse et établir le bilan mensuel",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=bool(non_validees),
+                    help="Valide d'abord chaque semaine." if non_validees else None,
+                ):
+                    recettes_combinees = []
+                    depenses_combinees = []
+                    for i in indices_exploitables:
+                        recettes_combinees.extend(obtenir_donnees_semaine(i, "recettes"))
+                        depenses_combinees.extend(obtenir_donnees_semaine(i, "depenses"))
+
+                    # Le rapport est FIGÉ : une modification ultérieure d'un
+                    # éditeur ne peut plus altérer silencieusement un bilan déjà
+                    # établi (et potentiellement déjà écrit dans Google Sheets).
+                    st.session_state.rapport_fige = calculer_bilan_mensuel_agrege(
+                        recettes_combinees, depenses_combinees, debut_mois.year, debut_mois.month
+                    )
+                    st.session_state.bilan_etabli = True
+                    st.rerun()
+                st.stop()
+
+            # ====================================================
+            # BILAN ÉTABLI : affichage + enregistrement
+            # ====================================================
+            rapport = st.session_state.rapport_fige
             afficher_bilan_mensuel(rapport)
 
-            st.divider()
-            if st.session_state.bilan_enregistre:
-                st.success("✅ Ce bilan mensuel a déjà été enregistré dans Google Sheets.")
-                if st.button("📥 Traiter un nouveau lot d'images (mois suivant)", type="primary"):
-                    reinitialiser_lot()
+            with st.expander("🖊️ Besoin de corriger encore une donnée ?"):
+                st.caption(
+                    "Reprendre les modifications déverrouille les tableaux hebdomadaires et annule "
+                    "le bilan actuel. Il faudra le rétablir ensuite. "
+                    "Les écritures déjà effectuées dans Google Sheets ne sont PAS annulées."
+                )
+                if st.button("↩️ Reprendre les modifications"):
+                    st.session_state.bilan_etabli = False
+                    st.session_state.rapport_fige = None
+                    st.session_state.semaines_validees = set()
+                    st.session_state.structure_depenses = None
+                    st.session_state.depenses_ecrites = False
+                    st.session_state.bilan_enregistre = False
+                    st.session_state.sous_page = 0
                     st.rerun()
+
+            # ====================================================
+            # ÉCRITURE DES DÉPENSES DANS L'ONGLET "EXPENSES" DU CLIENT
+            # ====================================================
+            st.divider()
+            st.markdown("### 💸 Enregistrer les dépenses dans la feuille du client")
+            nom_onglet_dep = st.session_state.config.get("nom_onglet_depenses", NOM_ONGLET_DEPENSES_DEFAUT)
+            nom_mois_rapport = NOMS_MOIS[rapport["mois"]]
+            st.caption(
+                f"Onglet ciblé : **{nom_onglet_dep}** — colonne du mois de "
+                f"**{nom_mois_rapport} {rapport['annee']}** "
+                f"(colonne {numero_colonne_vers_lettre(rapport['mois'] + OFFSET_COLONNE_MOIS)})."
+            )
+
+            if not rapport["depenses_par_titre"]:
+                st.info("ℹ️ Aucune dépense à enregistrer pour ce mois.")
+
+            elif st.session_state.structure_depenses is None:
+                st.write(
+                    "L'app va d'abord lire les postes de dépense déjà présents dans la feuille du client, "
+                    "puis te proposer un rapprochement automatique que tu pourras corriger avant écriture."
+                )
+                if st.button("🔗 Lire l'onglet Expenses du client", type="primary"):
+                    with st.spinner("Lecture de la feuille du client en cours..."):
+                        try:
+                            feuille_dep = get_onglet(nom_onglet_dep)
+                            st.session_state.structure_depenses = lire_structure_depenses(feuille_dep)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"🚨 {message_erreur_sheets(e)}")
+
             else:
-                if st.button("💾 Enregistrer le bilan mensuel dans Google Sheets", type="primary"):
-                    with st.spinner("Écriture dans Google Sheets en cours..."):
+                structure = st.session_state.structure_depenses
+                postes = lister_postes(structure)
+
+                if not postes:
+                    st.error(
+                        f"🚨 Aucun poste de dépense n'a été trouvé dans l'onglet « {nom_onglet_dep} ». "
+                        "Vérifie que les intitulés sont bien en colonne C et que les lignes de totaux "
+                        "contiennent « Monthly totals: »."
+                    )
+                    if st.button("🔄 Relire l'onglet"):
+                        st.session_state.structure_depenses = None
+                        st.rerun()
+                    st.stop()
+
+                nb_rubriques = len(structure["rubriques"])
+                st.success(f"✅ Feuille lue : {nb_rubriques} rubrique(s), {len(postes)} poste(s) de dépense disponibles.")
+
+                libelle_par_ligne = {
+                    p["ligne"]: f"{p['rubrique']} › {p['nom']}   (ligne {p['ligne']})"
+                    for p in postes
+                }
+                options_lignes = [None] + [p["ligne"] for p in postes]
+
+                st.markdown("#### Rapprochement des dépenses")
+                st.caption(
+                    "Vérifie la destination proposée pour chaque dépense. Les postes de rubriques "
+                    "récurrentes (dépenses fixes, dépenses diverses) sont privilégiés automatiquement."
+                )
+
+                choix_par_titre = {}
+                for titre, montant in sorted(rapport["depenses_par_titre"].items(), key=lambda x: -x[1]):
+                    auto = trouver_appariement_auto(titre, postes)
+                    index_defaut = options_lignes.index(auto["ligne"]) if auto else 0
+                    marqueur = "✅" if auto else "❓"
+                    choix_par_titre[titre] = st.selectbox(
+                        f"{marqueur} **{titre}** — {formater_montant(montant)} FCFA",
+                        options=options_lignes,
+                        format_func=lambda v: "⏭️ Ne pas enregistrer" if v is None else libelle_par_ligne[v],
+                        index=index_defaut,
+                        key=f"dest_depense_{normaliser_libelle(titre)}",
+                    )
+
+                # Plusieurs dépenses peuvent viser le même poste : on les cumule.
+                montants_par_ligne: dict = {}
+                titres_par_ligne: dict = {}
+                for titre, ligne_cible in choix_par_titre.items():
+                    if ligne_cible is None:
+                        continue
+                    montants_par_ligne[ligne_cible] = montants_par_ligne.get(ligne_cible, 0.0) + rapport["depenses_par_titre"][titre]
+                    titres_par_ligne.setdefault(ligne_cible, []).append(titre)
+
+                st.markdown("#### Aperçu avant écriture")
+                if not montants_par_ligne:
+                    st.warning("⚠️ Aucune dépense n'est actuellement destinée à être écrite.")
+                else:
+                    apercu = []
+                    ecrasements = 0
+                    for ligne_cible, montant in sorted(montants_par_ligne.items()):
+                        actuelle = valeur_actuelle_cellule(structure, ligne_cible, rapport["mois"])
+                        if actuelle:
+                            ecrasements += 1
+                        apercu.append({
+                            "Destination": libelle_par_ligne[ligne_cible],
+                            "Dépense(s)": ", ".join(titres_par_ligne[ligne_cible]),
+                            "Montant à écrire": f"{formater_montant(montant)} FCFA",
+                            "Valeur actuelle": actuelle or "(vide)",
+                        })
+                    st.table(apercu)
+
+                    total_ecrit = sum(montants_par_ligne.values())
+                    non_affectees = rapport["total_depenses"] - total_ecrit
+                    c1, c2 = st.columns(2)
+                    c1.metric("Total qui sera écrit", f"{formater_montant(total_ecrit)} FCFA")
+                    c2.metric("Non affecté", f"{formater_montant(non_affectees)} FCFA")
+
+                    if non_affectees > 0:
+                        st.warning(
+                            f"⚠️ {formater_montant(non_affectees)} FCFA de dépenses ne seront pas écrites "
+                            "(marquées « Ne pas enregistrer »)."
+                        )
+                    if ecrasements:
+                        st.warning(
+                            f"⚠️ {ecrasements} cellule(s) contiennent déjà une valeur pour "
+                            f"{nom_mois_rapport} : elle sera remplacée."
+                        )
+
+                st.divider()
+                if st.session_state.depenses_ecrites:
+                    st.success(f"✅ Les dépenses ont été écrites dans l'onglet « {nom_onglet_dep} ».")
+                    if st.button("🔄 Relire la feuille et recommencer le rapprochement"):
+                        st.session_state.structure_depenses = None
+                        st.session_state.depenses_ecrites = False
+                        st.rerun()
+                else:
+                    col_ecrire, col_relire = st.columns(2)
+                    with col_ecrire:
+                        if st.button(
+                            "💾 Écrire les dépenses dans la feuille du client",
+                            type="primary",
+                            use_container_width=True,
+                            disabled=not montants_par_ligne,
+                        ):
+                            with st.spinner("Écriture dans la feuille du client en cours..."):
+                                try:
+                                    feuille_dep = get_onglet(nom_onglet_dep)
+                                    ecrire_depenses_client(feuille_dep, montants_par_ligne, rapport["mois"])
+                                    st.session_state.depenses_ecrites = True
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"🚨 Erreur lors de l'écriture : {message_erreur_sheets(e)}")
+                    with col_relire:
+                        if st.button("🔄 Relire l'onglet Expenses", use_container_width=True):
+                            st.session_state.structure_depenses = None
+                            st.rerun()
+
+            st.divider()
+            with st.expander("📄 Enregistrer aussi le résumé (recettes / dépenses / solde) sur le premier onglet"):
+                st.caption(
+                    "Écrit les 3 totaux du mois dans le premier onglet du classeur "
+                    f"(lignes {LIGNE_RECETTES_MENSUEL} à {LIGNE_SOLDE_MENSUEL}). "
+                    "À n'utiliser que si cet onglet est bien prévu pour ça."
+                )
+                if st.session_state.bilan_enregistre:
+                    st.success("✅ Résumé déjà enregistré.")
+                elif st.button("💾 Enregistrer le résumé mensuel"):
+                    with st.spinner("Écriture en cours..."):
                         try:
                             _, feuille_principale = get_clients_config()
                             enregistrer_bilan_mensuel(feuille_principale, rapport)
                             st.session_state.bilan_enregistre = True
-                            st.success("✨ Bilan mensuel enregistré avec succès !")
+                            st.success("✨ Résumé mensuel enregistré.")
                             st.rerun()
                         except Exception as e:
-                            st.error(f"🚨 Une erreur est survenue lors de l'enregistrement : {e}")
+                            st.error(f"🚨 Une erreur est survenue lors de l'enregistrement : {message_erreur_sheets(e)}")
+
+            st.divider()
+            if st.button("📥 Traiter un nouveau lot d'images (mois suivant)"):
+                reinitialiser_lot()
+                st.rerun()
