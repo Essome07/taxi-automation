@@ -187,6 +187,14 @@ def lister_classeurs_accessibles() -> list:
     return reponse.json().get("files", [])
 
 
+def lister_onglets_classeur(sheet_id: str) -> list:
+    """Renvoie les noms des onglets d'un classeur, pour que l'utilisateur
+    choisisse sa destination dans une liste plutôt que de la saisir à la main
+    (une majuscule ou un accent de travers suffisait à faire échouer l'écriture)."""
+    classeur = get_gspread_client().open_by_key(sheet_id)
+    return [f.title for f in classeur.worksheets()]
+
+
 def diagnostiquer_acces_feuille(sheet_id: str) -> dict:
     """Vérifie, SANS RIEN MODIFIER, si le compte de service peut lire et
     écrire dans le classeur du client.
@@ -1227,6 +1235,7 @@ if st.session_state.page == "⚙️ Paramètres":
             st.session_state.config["sheet_principale_id"] = choix_classeur
             sauvegarder_config(st.session_state.config)
             st.session_state.structure_depenses = None
+            st.session_state.onglets_classeur = None  # liste obsolète : autre classeur
             st.success(f"✅ Classeur « {options[choix_classeur]} » sélectionné.")
             st.rerun()
     elif classeurs == []:
@@ -1239,11 +1248,45 @@ if st.session_state.page == "⚙️ Paramètres":
         "Classeur du client (identifiant ou URL)",
         value=st.session_state.config["sheet_principale_id"],
     )
-    nouvel_onglet_depenses = st.text_input(
-        "Nom de l'onglet des dépenses",
-        value=st.session_state.config.get("nom_onglet_depenses", NOM_ONGLET_DEPENSES_DEFAUT),
-        help="Doit correspondre exactement au nom de l'onglet dans Google Sheets (majuscules comprises).",
+    st.markdown("**Onglet de destination des dépenses**")
+    st.caption(
+        "Choisis, parmi les onglets réellement présents dans le classeur sélectionné, celui qui "
+        "contient le tableau des dépenses à compléter."
     )
+
+    if st.button("📑 Lister les onglets de ce classeur"):
+        with st.spinner("Lecture des onglets..."):
+            try:
+                st.session_state.onglets_classeur = lister_onglets_classeur(
+                    st.session_state.config["sheet_principale_id"]
+                )
+            except Exception as e:
+                st.session_state.onglets_classeur = []
+                st.error(f"🚨 {message_erreur_sheets(e)}")
+
+    onglets_dispo = st.session_state.get("onglets_classeur")
+    onglet_actuel = st.session_state.config.get("nom_onglet_depenses", NOM_ONGLET_DEPENSES_DEFAUT)
+
+    if onglets_dispo:
+        index_defaut = onglets_dispo.index(onglet_actuel) if onglet_actuel in onglets_dispo else 0
+        nouvel_onglet_depenses = st.selectbox(
+            "Onglet des dépenses",
+            options=onglets_dispo,
+            index=index_defaut,
+        )
+        if onglet_actuel not in onglets_dispo:
+            st.warning(
+                f"⚠️ L'onglet actuellement configuré (« {onglet_actuel} ») n'existe pas dans ce "
+                "classeur. Sélectionne le bon ci-dessus, puis enregistre les paramètres."
+            )
+    else:
+        if onglets_dispo == []:
+            st.warning("⚠️ Aucun onglet n'a pu être lu. Vérifie d'abord l'accès au classeur.")
+        nouvel_onglet_depenses = st.text_input(
+            "Nom de l'onglet des dépenses",
+            value=onglet_actuel,
+            help="Utilise le bouton ci-dessus pour choisir dans la liste réelle des onglets.",
+        )
 
     st.subheader("Rapport mensuel autonome")
     st.caption(
@@ -1267,6 +1310,7 @@ if st.session_state.page == "⚙️ Paramètres":
         }
         sauvegarder_config(st.session_state.config)
         st.session_state.structure_depenses = None
+        st.session_state.onglets_classeur = None  # l'ID du classeur a pu changer
         st.success("✅ Paramètres enregistrés. Ils seront utilisés pour tous les prochains rapports.")
 
     st.divider()
@@ -2020,9 +2064,15 @@ else:
 
                 if not postes:
                     st.error(
-                        f"🚨 Aucun poste de dépense n'a été trouvé dans l'onglet « {nom_onglet_dep} ». "
-                        "Vérifie que les intitulés sont bien en colonne C et que les lignes de totaux "
-                        "contiennent « Monthly totals: »."
+                        f"🚨 Aucun poste de dépense n'a été trouvé dans l'onglet « {nom_onglet_dep} »."
+                    )
+                    st.info(
+                        "Deux causes possibles :\n\n"
+                        "- **Ce n'est pas le bon onglet** → change-le dans ⚙️ Paramètres "
+                        "(bouton « Lister les onglets de ce classeur »).\n"
+                        "- **L'onglet n'a pas la structure attendue** → les intitulés des postes "
+                        "doivent être en colonne C, et chaque rubrique doit commencer par une ligne "
+                        "contenant « Monthly totals: »."
                     )
                     if st.button("🔄 Relire l'onglet"):
                         st.session_state.structure_depenses = None
