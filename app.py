@@ -162,6 +162,31 @@ def get_gspread_client():
     return gspread.authorize(charger_credentials())
 
 
+def lister_classeurs_accessibles() -> list:
+    """Liste les classeurs Google Sheets auxquels le compte de service a
+    réellement accès. C'est le moyen le plus direct de vérifier qu'un partage
+    a bien été pris en compte, et de récupérer le bon identifiant : si un
+    fichier n'apparaît pas ici, c'est que le partage n'a pas abouti."""
+    session = AuthorizedSession(charger_credentials())
+    reponse = session.get(
+        "https://www.googleapis.com/drive/v3/files",
+        params={
+            "q": "mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
+            "fields": "files(id,name,owners/emailAddress)",
+            "pageSize": 50,
+            "supportsAllDrives": "true",
+            "includeItemsFromAllDrives": "true",
+        },
+        timeout=30,
+    )
+    if reponse.status_code != 200:
+        raise RuntimeError(
+            f"Google Drive a répondu avec le code {reponse.status_code}. "
+            "Vérifie que l'API Google Drive est bien activée sur le projet du compte de service."
+        )
+    return reponse.json().get("files", [])
+
+
 def diagnostiquer_acces_feuille(sheet_id: str) -> dict:
     """Vérifie, SANS RIEN MODIFIER, si le compte de service peut lire et
     écrire dans le classeur du client.
@@ -1255,6 +1280,28 @@ if st.session_state.page == "⚙️ Paramètres":
             else:
                 st.error(f"🚨 {diagnostic['message']}")
                 st.info("Vérifie l'identifiant du classeur ci-dessus, puis le partage avec le compte de service.")
+
+                st.markdown("**Classeurs auxquels le compte de service a réellement accès :**")
+                try:
+                    accessibles = lister_classeurs_accessibles()
+                    if not accessibles:
+                        st.warning(
+                            "⚠️ Le compte de service n'a accès à **aucun** classeur. Le partage n'a donc "
+                            "pas abouti. Rouvre le fichier dans Google Sheets, clique sur « Partager », et "
+                            "vérifie que l'adresse du compte de service apparaît bien dans la liste des "
+                            "personnes ayant accès (il ne suffit pas de la saisir : il faut valider l'envoi)."
+                        )
+                    else:
+                        st.caption(
+                            "Copie l'identifiant du bon classeur ci-dessous dans le champ « Classeur du "
+                            "client », puis enregistre les paramètres."
+                        )
+                        st.table([
+                            {"Nom du classeur": f.get("name", ""), "Identifiant à copier": f.get("id", "")}
+                            for f in accessibles
+                        ])
+                except Exception as e:
+                    st.error(f"🚨 Impossible de lister les classeurs : {message_erreur_sheets(e)}")
 
             if diagnostic["statut"] in ("editeur", "lecture_seule"):
                 try:
