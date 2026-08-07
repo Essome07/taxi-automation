@@ -20,6 +20,7 @@ Interface organisée en 3 sections (barre latérale) :
 import base64
 import datetime
 import hashlib
+import io
 import json
 import os
 import re
@@ -530,6 +531,29 @@ def hachage_fichier(fichier) -> str:
     empreinte = hashlib.md5(fichier.read()).hexdigest()
     fichier.seek(0)
     return empreinte
+
+
+class FichierMemorise(io.BytesIO):
+    """Copie en mémoire d'une image téléversée.
+
+    Streamlit efface le contenu d'un file_uploader dès que celui-ci n'est plus
+    affiché à l'écran : changer d'onglet ferait donc perdre les 5 photos et
+    relancerait tout le processus depuis le début. En recopiant les octets ici,
+    le lot survit à la navigation. Cette classe expose les mêmes attributs
+    qu'un fichier téléversé (name, size, type) pour rester interchangeable."""
+
+    def __init__(self, nom: str, type_mime: str, contenu: bytes):
+        super().__init__(contenu)
+        self.name = nom
+        self.type = type_mime or "image/jpeg"
+        self.size = len(contenu)
+
+
+def memoriser_fichiers(fichiers_uploades: list) -> list:
+    return [
+        FichierMemorise(f.name, getattr(f, "type", None), f.getvalue())
+        for f in fichiers_uploades
+    ]
 
 
 def estimer_ordre_upload(fichiers: list) -> list:
@@ -1075,6 +1099,7 @@ for cle, defaut in {
     "config": None,
     "cle_uploader": 0,
     "signature_lot": None,
+    "fichiers_lot": None,
     "page": "📤 Nouveau rapport",
     "lot_donnees": None,
     "donnees_filtrees": None,
@@ -1108,6 +1133,7 @@ def reinitialiser_lot() -> None:
             del st.session_state[cle]
     st.session_state.cle_uploader += 1
     st.session_state.signature_lot = None
+    st.session_state.fichiers_lot = None
     st.session_state.lot_donnees = None
     st.session_state.donnees_filtrees = None
     st.session_state.mois_confirme = False
@@ -1486,30 +1512,33 @@ else:
     st.title("📤 Nouveau rapport")
     st.write(f"Uploade exactement {MAX_IMAGES_PAR_LOT} rapports hebdomadaires (un mois complet, glisser-déposer possible).")
 
-    fichiers = st.file_uploader(
+    fichiers_uploades = st.file_uploader(
         f"Sélectionner les {MAX_IMAGES_PAR_LOT} images des rapports",
         type=["jpg", "jpeg", "png"],
         accept_multiple_files=True,
         key=f"uploader_{st.session_state.cle_uploader}",
     )
 
-    if fichiers:
-        if len(fichiers) > MAX_IMAGES_PAR_LOT:
+    if fichiers_uploades:
+        if len(fichiers_uploades) > MAX_IMAGES_PAR_LOT:
             st.warning(f"⚠️ Maximum {MAX_IMAGES_PAR_LOT} images à la fois. Seules les {MAX_IMAGES_PAR_LOT} premières seront prises en compte.")
-            fichiers = fichiers[:MAX_IMAGES_PAR_LOT]
+            fichiers_uploades = fichiers_uploades[:MAX_IMAGES_PAR_LOT]
 
-        if len(fichiers) < MAX_IMAGES_PAR_LOT:
+        if len(fichiers_uploades) < MAX_IMAGES_PAR_LOT:
             st.info(
                 f"📸 L'analyse ne se lance qu'à partir d'un lot complet de {MAX_IMAGES_PAR_LOT} rapports "
-                f"hebdomadaires (un mois entier). Il t'en manque {MAX_IMAGES_PAR_LOT - len(fichiers)}."
+                f"hebdomadaires (un mois entier). Il t'en manque {MAX_IMAGES_PAR_LOT - len(fichiers_uploades)}."
             )
             st.stop()
 
-        signature = tuple((f.name, f.size) for f in fichiers)
+        signature = tuple((f.name, f.size) for f in fichiers_uploades)
         if st.session_state.signature_lot != signature:
             for cle in list(st.session_state.keys()):
                 if cle.startswith("editeur_recettes_") or cle.startswith("editeur_depenses_"):
                     del st.session_state[cle]
+            # Copie en mémoire : le lot doit survivre à un passage par
+            # Maintenance ou Paramètres, qui vide le file_uploader.
+            st.session_state.fichiers_lot = memoriser_fichiers(fichiers_uploades)
             st.session_state.signature_lot = signature
             st.session_state.lot_donnees = None
             st.session_state.donnees_filtrees = None
@@ -1519,7 +1548,7 @@ else:
             st.session_state.trous_ignores = set()
             st.session_state.fichiers_combles = {}
             st.session_state.ordre_chronologique = None
-            st.session_state.ordre_upload_estime = estimer_ordre_upload(fichiers)
+            st.session_state.ordre_upload_estime = estimer_ordre_upload(st.session_state.fichiers_lot)
             st.session_state.semaines_validees = set()
             st.session_state.bilan_etabli = False
             st.session_state.rapport_fige = None
@@ -1527,6 +1556,20 @@ else:
             st.session_state.rapport_mensuel_cree = None
             st.session_state.structure_depenses = None
             st.session_state.depenses_ecrites = False
+
+    fichiers = st.session_state.fichiers_lot
+
+    if fichiers:
+        if not fichiers_uploades:
+            # Retour depuis un autre onglet : le widget est vide, mais le lot
+            # est conservé. On le rappelle pour éviter toute confusion.
+            col_info, col_reset = st.columns([3, 1])
+            with col_info:
+                st.info(f"📂 Lot en cours : {len(fichiers)} photos déjà chargées.")
+            with col_reset:
+                if st.button("🗑️ Changer de lot", use_container_width=True):
+                    reinitialiser_lot()
+                    st.rerun()
 
         total_fichiers = len(fichiers)
         fichiers_effectifs = [fichiers[j] for j in st.session_state.ordre_upload_estime]
@@ -1702,7 +1745,11 @@ else:
                                         chevauche = p and not (p[1] < debut_trou or p[0] > fin_trou)
                                         if chevauche:
                                             st.session_state.lot_donnees.append(donnees_comblees)
-                                            st.session_state.fichiers_combles[cle_trou] = fichier_combler
+                                            st.session_state.fichiers_combles[cle_trou] = FichierMemorise(
+                                                fichier_combler.name,
+                                                getattr(fichier_combler, "type", None),
+                                                fichier_combler.getvalue(),
+                                            )
                                             st.success("✅ Photo ajoutée : elle correspond bien à la période manquante.")
                                             st.rerun()
                                         else:
