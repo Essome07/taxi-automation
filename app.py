@@ -100,6 +100,7 @@ def charger_config() -> dict:
     defaut = {
         "sheet_principale_id": SHEET_PRINCIPALE_ID_DEFAUT,
         "nom_onglet_depenses": NOM_ONGLET_DEPENSES_DEFAUT,
+        "emails_partage_rapport": "",
         "nom_utilisateur": "Pascal",
     }
     if os.path.exists(CONFIG_PATH):
@@ -673,6 +674,7 @@ def calculer_bilan_mensuel_agrege(recettes_combinees: list[dict], depenses_combi
     recette_totale = calculer_total_recettes(recettes_combinees)
 
     depenses_par_titre: dict = {}
+    depenses_detaillees: list = []
     for dep in depenses_combinees:
         titre = str(dep.get("titre", "")).strip() or "Dépense"
         try:
@@ -680,6 +682,14 @@ def calculer_bilan_mensuel_agrege(recettes_combinees: list[dict], depenses_combi
         except (TypeError, ValueError):
             montant = 0.0
         depenses_par_titre[titre] = depenses_par_titre.get(titre, 0.0) + montant
+        depenses_detaillees.append({
+            "date": parser_date(str(dep.get("date", ""))),
+            "titre": titre,
+            "montant": montant,
+        })
+
+    # Tri chronologique ; les dépenses sans date exploitable sont reléguées en fin
+    depenses_detaillees.sort(key=lambda d: (d["date"] is None, d["date"] or datetime.date.max))
 
     total_depenses = sum(depenses_par_titre.values())
     return {
@@ -688,8 +698,149 @@ def calculer_bilan_mensuel_agrege(recettes_combinees: list[dict], depenses_combi
         "jours_travailles": len(jours_recette),
         "recette_totale": recette_totale,
         "depenses_par_titre": depenses_par_titre,
+        "depenses_detaillees": depenses_detaillees,
         "total_depenses": total_depenses,
         "solde_net": recette_totale - total_depenses,
+    }
+
+
+# ============================================================
+# RAPPORT MENSUEL AUTONOME (un classeur Google Sheets par mois)
+# Reproduit la maquette validée : tableau daté des dépenses,
+# puis bloc de synthèse (jours travaillés, recettes, dépenses, solde).
+# ============================================================
+TITRE_RAPPORT_MENSUEL = "Rapport mensuel ({mois:02d}/{annee})"
+EN_TETES_RAPPORT = ["DATE", "CATÉGORIE", "TOTAL (XAF)"]
+COULEUR_EN_TETE = {"red": 0.60, "green": 0.11, "blue": 0.16}  # bordeaux de la maquette
+
+
+def construire_lignes_rapport(rapport: dict) -> tuple[list, int]:
+    """Prépare le contenu complet de la feuille : en-têtes, une ligne par
+    dépense datée, puis le bloc de synthèse. Renvoie aussi le numéro de la
+    première ligne de synthèse (utile pour la mise en forme)."""
+    lignes = [EN_TETES_RAPPORT]
+
+    for dep in rapport.get("depenses_detaillees", []):
+        date_affichee = dep["date"].strftime("%d/%m/%y") if dep["date"] else ""
+        lignes.append([date_affichee, dep["titre"], dep["montant"]])
+
+    premiere_ligne_synthese = len(lignes) + 1
+    lignes.extend([
+        ["Nombre de jours travaillés", "", rapport["jours_travailles"]],
+        ["Recette totale", "", rapport["recette_totale"]],
+        ["Dépenses totales", "", rapport["total_depenses"]],
+        ["Solde net", "", rapport["solde_net"]],
+    ])
+    return lignes, premiere_ligne_synthese
+
+
+def mettre_en_forme_rapport(feuille, nb_lignes_total: int, premiere_ligne_synthese: int) -> None:
+    """Applique la mise en forme de la maquette : en-tête bordeaux, montants
+    alignés à droite avec séparateur de milliers, synthèse en gras italique."""
+    sheet_id = feuille.id
+    requetes = [
+        # Ligne d'en-tête : fond bordeaux, texte blanc en gras
+        {
+            "repeatCell": {
+                "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
+                          "startColumnIndex": 0, "endColumnIndex": 3},
+                "cell": {"userEnteredFormat": {
+                    "backgroundColor": COULEUR_EN_TETE,
+                    "textFormat": {"bold": True,
+                                   "foregroundColor": {"red": 1, "green": 1, "blue": 1}},
+                    "verticalAlignment": "MIDDLE",
+                }},
+                "fields": "userEnteredFormat(backgroundColor,textFormat,verticalAlignment)",
+            }
+        },
+        # Ligne d'en-tête figée : les titres restent visibles au défilement
+        {
+            "updateSheetProperties": {
+                "properties": {"sheetId": sheet_id, "gridProperties": {"frozenRowCount": 1}},
+                "fields": "gridProperties.frozenRowCount",
+            }
+        },
+        # Montants : séparateur de milliers, sans décimale
+        {
+            "repeatCell": {
+                "range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": nb_lignes_total,
+                          "startColumnIndex": 2, "endColumnIndex": 3},
+                "cell": {"userEnteredFormat": {
+                    "numberFormat": {"type": "NUMBER", "pattern": "#,##0"},
+                    "horizontalAlignment": "RIGHT",
+                }},
+                "fields": "userEnteredFormat(numberFormat,horizontalAlignment)",
+            }
+        },
+        # Bloc de synthèse : gras italique, comme sur la maquette
+        {
+            "repeatCell": {
+                "range": {"sheetId": sheet_id,
+                          "startRowIndex": premiere_ligne_synthese - 1,
+                          "endRowIndex": nb_lignes_total,
+                          "startColumnIndex": 0, "endColumnIndex": 3},
+                "cell": {"userEnteredFormat": {"textFormat": {"bold": True, "italic": True}}},
+                "fields": "userEnteredFormat.textFormat",
+            }
+        },
+        # Largeurs de colonnes lisibles
+        {
+            "updateDimensionProperties": {
+                "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
+                          "startIndex": 0, "endIndex": 1},
+                "properties": {"pixelSize": 200},
+                "fields": "pixelSize",
+            }
+        },
+        {
+            "updateDimensionProperties": {
+                "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
+                          "startIndex": 1, "endIndex": 3},
+                "properties": {"pixelSize": 150},
+                "fields": "pixelSize",
+            }
+        },
+    ]
+    feuille.spreadsheet.batch_update({"requests": requetes})
+
+
+def creer_rapport_mensuel_sheets(rapport: dict, emails_partage: list) -> dict:
+    """Crée un classeur Google Sheets dédié au mois, y écrit le récapitulatif
+    mis en forme, puis le partage avec les adresses fournies.
+
+    Le classeur est créé par le compte de service, qui en reste propriétaire :
+    le partage est donc INDISPENSABLE pour que quelqu'un d'autre puisse
+    l'ouvrir. C'est pour cette raison que la fonction refuse de créer un
+    rapport que personne ne pourrait consulter."""
+    if not emails_partage:
+        raise RuntimeError(
+            "Aucune adresse de partage n'est configurée. Le classeur serait créé au nom du "
+            "compte de service et resterait invisible pour toi comme pour le client. "
+            "Renseigne au moins une adresse Gmail dans ⚙️ Paramètres."
+        )
+
+    gc = get_gspread_client()
+    titre = TITRE_RAPPORT_MENSUEL.format(mois=rapport["mois"], annee=rapport["annee"])
+    classeur = gc.create(titre)
+    feuille = classeur.get_worksheet(0)
+
+    lignes, premiere_ligne_synthese = construire_lignes_rapport(rapport)
+    feuille.update(f"A1:C{len(lignes)}", lignes, value_input_option=VALUE_INPUT_OPTION)
+    mettre_en_forme_rapport(feuille, len(lignes), premiere_ligne_synthese)
+
+    partages_reussis, partages_echoues = [], []
+    for email in emails_partage:
+        try:
+            classeur.share(email, perm_type="user", role="writer", notify=False)
+            partages_reussis.append(email)
+        except Exception as e:
+            partages_echoues.append(f"{email} ({e})")
+
+    return {
+        "titre": titre,
+        "url": classeur.url,
+        "partages_reussis": partages_reussis,
+        "partages_echoues": partages_echoues,
     }
 
 
@@ -866,6 +1017,7 @@ for cle, defaut in {
     "bilan_etabli": False,
     "rapport_fige": None,
     "donnees_editees": {},
+    "rapport_mensuel_cree": None,
 }.items():
     if cle not in st.session_state:
         st.session_state[cle] = defaut
@@ -897,6 +1049,7 @@ def reinitialiser_lot() -> None:
     st.session_state.bilan_etabli = False
     st.session_state.rapport_fige = None
     st.session_state.donnees_editees = {}
+    st.session_state.rapport_mensuel_cree = None
     for cle in list(st.session_state.keys()):
         if cle.startswith("dest_depense_"):
             del st.session_state[cle]
@@ -1034,11 +1187,25 @@ if st.session_state.page == "⚙️ Paramètres":
         help="Doit correspondre exactement au nom de l'onglet dans Google Sheets (majuscules comprises).",
     )
 
+    st.subheader("Rapport mensuel autonome")
+    st.caption(
+        "Chaque mois, l'app peut créer un classeur Google Sheets dédié « Rapport mensuel (MM/AAAA) ». "
+        "Ce classeur est créé par le compte de service, qui en reste propriétaire : sans partage, "
+        "**personne d'autre ne pourrait l'ouvrir**. Indique donc les adresses Gmail qui doivent y "
+        "avoir accès (la tienne, celle du client…), séparées par des virgules."
+    )
+    nouveaux_emails = st.text_input(
+        "Adresses avec qui partager le rapport mensuel",
+        value=st.session_state.config.get("emails_partage_rapport", ""),
+        placeholder="moi@gmail.com, client@gmail.com",
+    )
+
     if st.button("💾 Enregistrer les paramètres", type="primary"):
         st.session_state.config = {
             "nom_utilisateur": nouveau_nom.strip() or "Pascal",
             "sheet_principale_id": extraire_id_depuis_url(nouveau_principale),
             "nom_onglet_depenses": nouvel_onglet_depenses.strip() or NOM_ONGLET_DEPENSES_DEFAUT,
+            "emails_partage_rapport": nouveaux_emails.strip(),
         }
         sauvegarder_config(st.session_state.config)
         st.session_state.structure_depenses = None
@@ -1192,6 +1359,7 @@ else:
             st.session_state.bilan_etabli = False
             st.session_state.rapport_fige = None
             st.session_state.donnees_editees = {}
+            st.session_state.rapport_mensuel_cree = None
             st.session_state.structure_depenses = None
             st.session_state.depenses_ecrites = False
 
@@ -1676,8 +1844,65 @@ else:
                     st.session_state.structure_depenses = None
                     st.session_state.depenses_ecrites = False
                     st.session_state.bilan_enregistre = False
+                    st.session_state.rapport_mensuel_cree = None
                     st.session_state.sous_page = 0
                     st.rerun()
+
+            # ====================================================
+            # RAPPORT MENSUEL AUTONOME (nouveau classeur dédié)
+            # ====================================================
+            st.divider()
+            st.markdown("### 📗 Créer le rapport mensuel dans Google Sheets")
+            titre_prevu = TITRE_RAPPORT_MENSUEL.format(mois=rapport["mois"], annee=rapport["annee"])
+            emails_bruts = st.session_state.config.get("emails_partage_rapport", "")
+            emails_partage = [e.strip() for e in re.split(r"[,;\s]+", emails_bruts) if e.strip()]
+
+            if st.session_state.rapport_mensuel_cree:
+                infos = st.session_state.rapport_mensuel_cree
+                st.success(f"✅ Classeur « {infos['titre']} » créé.")
+                st.markdown(f"🔗 [Ouvrir le rapport dans Google Sheets]({infos['url']})")
+                if infos["partages_reussis"]:
+                    st.caption("Partagé avec : " + ", ".join(infos["partages_reussis"]))
+                if infos["partages_echoues"]:
+                    st.warning("⚠️ Partage impossible pour : " + " ; ".join(infos["partages_echoues"]))
+                if st.button("🔄 Créer un nouveau classeur pour ce mois"):
+                    st.session_state.rapport_mensuel_cree = None
+                    st.rerun()
+            else:
+                st.caption(
+                    f"Un classeur **{titre_prevu}** sera créé, contenant le détail daté des dépenses "
+                    "puis la synthèse du mois (jours travaillés, recette totale, dépenses totales, solde net)."
+                )
+                lignes_apercu, _ = construire_lignes_rapport(rapport)
+                with st.expander(f"👁️ Aperçu du contenu ({len(lignes_apercu)} lignes)"):
+                    st.table([
+                        {"DATE": l[0], "CATÉGORIE": l[1], "TOTAL (XAF)": l[2]}
+                        for l in lignes_apercu[1:]
+                    ])
+
+                if not emails_partage:
+                    st.error(
+                        "🚨 Aucune adresse de partage configurée. Le classeur appartiendrait au compte "
+                        "de service et serait invisible pour toi. Renseigne au moins une adresse Gmail "
+                        "dans ⚙️ Paramètres avant de continuer."
+                    )
+                else:
+                    st.caption("Sera partagé avec : " + ", ".join(emails_partage))
+
+                if st.button(
+                    "📗 Créer le classeur du rapport mensuel",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=not emails_partage,
+                ):
+                    with st.spinner("Création du classeur et mise en forme en cours..."):
+                        try:
+                            st.session_state.rapport_mensuel_cree = creer_rapport_mensuel_sheets(
+                                rapport, emails_partage
+                            )
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"🚨 Création impossible : {message_erreur_sheets(e)}")
 
             # ====================================================
             # ÉCRITURE DES DÉPENSES DANS L'ONGLET "EXPENSES" DU CLIENT
