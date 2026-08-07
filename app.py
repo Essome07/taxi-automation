@@ -146,6 +146,58 @@ FEUILLE_DE_STYLE = """
     color: #F4E7D0;
 }
 
+/* --- Cartes de semaines (aperçu du lot) --- */
+.grille-semaines {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 12px;
+    margin: 6px 0 18px 0;
+}
+.carte-semaine {
+    background: var(--fond-carte);
+    border: 1px solid var(--bordure);
+    border-radius: 12px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+.carte-semaine .vignette {
+    height: 108px;
+    background: rgba(255, 255, 255, 0.04);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+}
+.carte-semaine .vignette img {
+    width: 100%; height: 100%;
+    object-fit: cover;
+}
+.carte-semaine .corps { padding: 10px 12px 12px 12px; }
+.carte-semaine .nom { font-weight: 700; font-size: 0.9rem; }
+.carte-semaine .periode {
+    font-size: 0.76rem;
+    color: var(--texte-doux);
+    margin: 2px 0 8px 0;
+}
+.carte-semaine .statut {
+    font-size: 0.74rem;
+    padding: 3px 8px;
+    border-radius: 999px;
+    display: inline-block;
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--texte-doux);
+}
+.carte-semaine .statut.ok {
+    background: var(--accent-doux);
+    color: #F4E7D0;
+    font-weight: 600;
+}
+.carte-semaine .statut.souci {
+    background: rgba(220, 90, 90, 0.18);
+    color: #F0BDBD;
+}
+
 /* --- Tableaux et éditeurs --- */
 [data-testid="stDataFrame"], [data-testid="stTable"] {
     border-radius: 10px;
@@ -163,6 +215,68 @@ def echapper_html(texte: str) -> str:
     """Neutralise les caractères spéciaux avant insertion dans un bloc HTML
     décoratif (un prénom contenant « & » ou « < » ne doit pas casser la page)."""
     return html.escape(str(texte), quote=True)
+
+
+def vignette_base64(fichier, largeur: int = 240) -> str:
+    """Produit une miniature encodée en base64, insérable directement dans le
+    HTML des cartes. On redimensionne avant encodage : intégrer les photos en
+    pleine résolution alourdirait la page de plusieurs mégaoctets à chaque
+    rechargement. Le résultat est mis en cache par empreinte du fichier."""
+    cache = st.session_state.setdefault("cache_vignettes", {})
+    fichier.seek(0)
+    contenu = fichier.read()
+    fichier.seek(0)
+    empreinte = hashlib.md5(contenu).hexdigest()
+    if empreinte in cache:
+        return cache[empreinte]
+
+    try:
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(contenu))
+        image = image.convert("RGB")
+        ratio = largeur / image.width
+        image = image.resize((largeur, max(1, int(image.height * ratio))))
+        tampon = io.BytesIO()
+        image.save(tampon, format="JPEG", quality=70)
+        encode = base64.b64encode(tampon.getvalue()).decode("utf-8")
+    except Exception:
+        # En cas de format inattendu, on retombe sur l'image d'origine :
+        # l'aperçu reste affiché plutôt que de faire échouer la page.
+        encode = base64.b64encode(contenu).decode("utf-8")
+
+    cache[empreinte] = encode
+    return encode
+
+
+def afficher_cartes_semaines(fichiers: list, lot_donnees) -> None:
+    """Aperçu du lot sous forme de cartes : vignette, numéro de semaine,
+    période détectée et état d'avancement. Purement informatif — aucune
+    interaction, donc aucun risque de casser le parcours."""
+    cartes = []
+    for indice, fichier in enumerate(fichiers):
+        donnees = lot_donnees[indice] if lot_donnees and indice < len(lot_donnees) else None
+
+        if donnees is None:
+            periode, statut, classe = "En attente d'analyse", "Photo chargée", ""
+        elif "erreur" in donnees:
+            periode, statut, classe = "—", "Non lisible", "souci"
+        else:
+            periode = donnees.get("periode_hebdo") or "Période non détectée"
+            total = calculer_total_recettes(donnees.get("recettes_journalieres", []))
+            statut, classe = f"Analysée · {formater_montant(total)} FCFA", "ok"
+
+        cartes.append(
+            f'<div class="carte-semaine">'
+            f'<div class="vignette"><img src="data:image/jpeg;base64,{vignette_base64(fichier)}"></div>'
+            f'<div class="corps">'
+            f'<div class="nom">Semaine {indice + 1}</div>'
+            f'<div class="periode">{echapper_html(periode)}</div>'
+            f'<div class="statut {classe}">{echapper_html(statut)}</div>'
+            f'</div></div>'
+        )
+
+    st.markdown(f'<div class="grille-semaines">{"".join(cartes)}</div>', unsafe_allow_html=True)
 
 
 def afficher_fil_etapes(etape_active: int) -> None:
@@ -1740,6 +1854,11 @@ else:
         else:
             # Avant analyse : ordre d'upload brut (l'ordre chronologique n'est pas encore connu).
             fichiers = fichiers_effectifs
+
+        # Aperçu visuel du lot, tant que la revue détaillée n'a pas commencé
+        # (au-delà, chaque semaine a déjà sa propre page avec sa photo).
+        if not st.session_state.mois_confirme:
+            afficher_cartes_semaines(fichiers, st.session_state.lot_donnees)
 
         # ============================================================
         # ÉTAPE 1 : analyse groupée des 5 rapports (Gemini)
