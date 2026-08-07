@@ -1198,12 +1198,45 @@ if st.session_state.page == "⚙️ Paramètres":
 
     st.subheader("Fichier Google Sheets du client")
     st.caption(
-        "Colle l'URL complète du fichier Google Sheets partagé par le client, ou juste "
-        "son identifiant (la partie entre `/d/` et `/edit` dans l'URL). Pense à vérifier "
-        "que le compte de service ci-contre y a bien un accès en écriture."
+        "Le plus fiable est de choisir directement dans la liste des classeurs déjà partagés "
+        "avec le compte de service : cela évite toute erreur d'identifiant. Tu peux sinon coller "
+        "l'URL complète du fichier, ou son identifiant."
     )
+
+    if st.button("📂 Lister les classeurs partagés avec le compte de service"):
+        with st.spinner("Interrogation de Google Drive..."):
+            try:
+                st.session_state.classeurs_accessibles = lister_classeurs_accessibles()
+            except Exception as e:
+                st.session_state.classeurs_accessibles = []
+                st.error(f"🚨 {message_erreur_sheets(e)}")
+
+    classeurs = st.session_state.get("classeurs_accessibles")
+    if classeurs:
+        options = {f["id"]: f.get("name", "(sans nom)") for f in classeurs}
+        ids = list(options.keys())
+        id_actuel = st.session_state.config["sheet_principale_id"]
+        index_defaut = ids.index(id_actuel) if id_actuel in ids else 0
+        choix_classeur = st.selectbox(
+            "Classeurs accessibles",
+            options=ids,
+            format_func=lambda i: f"{options[i]}  ({i[:12]}…)",
+            index=index_defaut,
+        )
+        if st.button("✅ Utiliser ce classeur"):
+            st.session_state.config["sheet_principale_id"] = choix_classeur
+            sauvegarder_config(st.session_state.config)
+            st.session_state.structure_depenses = None
+            st.success(f"✅ Classeur « {options[choix_classeur]} » sélectionné.")
+            st.rerun()
+    elif classeurs == []:
+        st.warning(
+            "⚠️ Aucun classeur n'est actuellement partagé avec le compte de service. "
+            "Partage d'abord la feuille avec l'adresse indiquée plus bas."
+        )
+
     nouveau_principale = st.text_input(
-        "Classeur du client",
+        "Classeur du client (identifiant ou URL)",
         value=st.session_state.config["sheet_principale_id"],
     )
     nouvel_onglet_depenses = st.text_input(
