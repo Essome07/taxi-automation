@@ -1,0 +1,15 @@
+# Thème de l'application — à placer dans .streamlit/config.toml
+# Reprend la palette de la maquette : fond sombre chaud, accent ambre.
+# Ce fichier ne touche à aucune fonctionnalité : uniquement les couleurs
+# et la typographie appliquées par Streamlit à tous ses composants.
+
+[theme]
+base = "dark"
+primaryColor = "#E8A33D"            # ambre : boutons principaux, éléments actifs
+backgroundColor = "#14161A"         # fond principal
+secondaryBackgroundColor = "#1C1F26" # barre latérale, cartes, champs
+textColor = "#E8E6E3"
+font = "sans serif"
+
+[server]
+maxUploadSize = 25                  # 5 photos de rapport : 25 Mo suffisent largement
