@@ -20,6 +20,7 @@ Interface organisée en 3 sections (barre latérale) :
 import base64
 import datetime
 import hashlib
+import html
 import io
 import json
 import os
@@ -38,17 +39,150 @@ from google.auth.transport.requests import AuthorizedSession
 # ============================================================
 st.set_page_config(page_title="Taxi Dashboard - Automatisation", page_icon="🚖", layout="wide")
 
-# Masque les vignettes natives (icône + nom + taille + croix) que Streamlit
-# affiche sous chaque file_uploader : la revue visuelle des photos (Étape 1)
-# remplace déjà ce rôle de façon plus soignée.
-st.markdown(
-    """
-    <style>
-    [data-testid="stFileUploaderFile"] { display: none; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+# ============================================================
+# HABILLAGE VISUEL
+# ------------------------------------------------------------
+# Tout ce bloc est PUREMENT DÉCORATIF. Il n'ajoute, ne retire et
+# ne modifie aucun comportement : les widgets restent des widgets
+# Streamlit standards. En cas de souci d'affichage après une mise
+# à jour de Streamlit, on peut neutraliser ce bloc sans casser
+# l'application (elle retrouve simplement son apparence par défaut).
+# ============================================================
+FEUILLE_DE_STYLE = """
+<style>
+:root {
+    --accent: #E8A33D;
+    --accent-doux: rgba(232, 163, 61, 0.14);
+    --fond-carte: #1C1F26;
+    --bordure: rgba(255, 255, 255, 0.08);
+    --texte-doux: rgba(232, 230, 227, 0.62);
+}
+
+/* Masque les vignettes natives du file_uploader : la revue visuelle
+   des photos joue déjà ce rôle, de façon plus soignée. */
+[data-testid="stFileUploaderFile"] { display: none; }
+
+/* --- Barre latérale --- */
+[data-testid="stSidebar"] {
+    border-right: 1px solid var(--bordure);
+}
+[data-testid="stSidebar"] [data-testid="stRadio"] label {
+    padding: 6px 10px;
+    border-radius: 8px;
+    transition: background 0.15s ease;
+}
+[data-testid="stSidebar"] [data-testid="stRadio"] label:hover {
+    background: var(--accent-doux);
+}
+
+/* --- Boutons --- */
+.stButton > button {
+    border-radius: 10px;
+    font-weight: 600;
+    border: 1px solid var(--bordure);
+    transition: transform 0.08s ease, box-shadow 0.15s ease;
+}
+.stButton > button:hover:not(:disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+}
+.stButton > button:disabled { opacity: 0.45; }
+
+/* --- Cartes d'information --- */
+.carte-entete {
+    background: var(--fond-carte);
+    border: 1px solid var(--bordure);
+    border-left: 3px solid var(--accent);
+    border-radius: 10px;
+    padding: 12px 16px;
+    margin-bottom: 4px;
+}
+.carte-entete .surtitre {
+    font-size: 0.68rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--texte-doux);
+}
+.carte-entete .titre { font-size: 1.05rem; font-weight: 700; }
+
+/* --- Fil des étapes --- */
+.fil-etapes {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin: 4px 0 18px 0;
+}
+.fil-etapes .etape {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 14px 7px 8px;
+    border-radius: 999px;
+    background: var(--fond-carte);
+    border: 1px solid var(--bordure);
+    font-size: 0.86rem;
+    color: var(--texte-doux);
+}
+.fil-etapes .etape .puce {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px; height: 22px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.07);
+    font-size: 0.76rem;
+    font-weight: 700;
+}
+.fil-etapes .etape.active {
+    background: var(--accent-doux);
+    border-color: var(--accent);
+    color: #F4E7D0;
+    font-weight: 600;
+}
+.fil-etapes .etape.active .puce { background: var(--accent); color: #14161A; }
+.fil-etapes .etape.faite { color: rgba(232, 230, 227, 0.85); }
+.fil-etapes .etape.faite .puce {
+    background: rgba(232, 163, 61, 0.35);
+    color: #F4E7D0;
+}
+
+/* --- Tableaux et éditeurs --- */
+[data-testid="stDataFrame"], [data-testid="stTable"] {
+    border-radius: 10px;
+    overflow: hidden;
+}
+
+/* --- Titres --- */
+h1, h2, h3 { letter-spacing: -0.01em; }
+</style>
+"""
+st.markdown(FEUILLE_DE_STYLE, unsafe_allow_html=True)
+
+
+def echapper_html(texte: str) -> str:
+    """Neutralise les caractères spéciaux avant insertion dans un bloc HTML
+    décoratif (un prénom contenant « & » ou « < » ne doit pas casser la page)."""
+    return html.escape(str(texte), quote=True)
+
+
+def afficher_fil_etapes(etape_active: int) -> None:
+    """Affiche le fil des 5 étapes du parcours. Purement indicatif : la
+    progression est déduite de l'état réel de l'application, ce fil ne
+    pilote rien et ne permet pas de naviguer."""
+    etapes = ["Photos", "Analyse", "Confirmation", "Vérification", "Bilan"]
+    morceaux = []
+    for numero, libelle in enumerate(etapes, start=1):
+        if numero < etape_active:
+            classe, puce = "etape faite", "✓"
+        elif numero == etape_active:
+            classe, puce = "etape active", str(numero)
+        else:
+            classe, puce = "etape", str(numero)
+        morceaux.append(
+            f'<div class="{classe}"><span class="puce">{puce}</span>{libelle}</div>'
+        )
+    st.markdown(f'<div class="fil-etapes">{"".join(morceaux)}</div>', unsafe_allow_html=True)
+
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -1233,7 +1367,11 @@ def afficher_bilan_mensuel(rapport: dict) -> None:
 # ============================================================
 with st.sidebar:
     st.markdown("## 🚖 Taxi Dashboard")
-    st.caption("Automatisation des rapports hebdomadaires")
+    st.markdown(
+        '<div style="font-size:0.68rem;letter-spacing:0.16em;text-transform:uppercase;'
+        'color:rgba(232,230,227,0.55);margin:-8px 0 14px 2px;">Rapports mensuels</div>',
+        unsafe_allow_html=True,
+    )
 
     heure = datetime.datetime.now().hour
     if heure < 5:
@@ -1244,7 +1382,13 @@ with st.sidebar:
         salutation = "Bon après-midi"
     else:
         salutation = "Bonsoir"
-    st.markdown(f"### {salutation}, {st.session_state.config['nom_utilisateur']} 👋")
+    st.markdown(
+        f'<div class="carte-entete">'
+        f'<div class="surtitre">{salutation}</div>'
+        f'<div class="titre">{echapper_html(st.session_state.config["nom_utilisateur"])}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
     st.divider()
     st.session_state.page = st.radio(
@@ -1510,6 +1654,20 @@ elif st.session_state.page == "🔃 Maintenance":
 # ============================================================
 else:
     st.title("📤 Nouveau rapport")
+
+    # Progression déduite de l'état réel : ce fil ne pilote rien, il informe.
+    if not st.session_state.fichiers_lot:
+        _etape_courante = 1
+    elif st.session_state.lot_donnees is None:
+        _etape_courante = 2
+    elif not st.session_state.mois_confirme:
+        _etape_courante = 3
+    elif st.session_state.sous_page >= len(st.session_state.lot_donnees):
+        _etape_courante = 5
+    else:
+        _etape_courante = 4
+    afficher_fil_etapes(_etape_courante)
+
     st.write(f"Uploade exactement {MAX_IMAGES_PAR_LOT} rapports hebdomadaires (un mois complet, glisser-déposer possible).")
 
     fichiers_uploades = st.file_uploader(
