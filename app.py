@@ -491,6 +491,23 @@ def diagnostiquer_acces_feuille(sheet_id: str) -> dict:
     }
 
 
+def get_gemini_key() -> str:
+    """Récupère la clé Gemini seule.
+
+    Volontairement séparé de l'accès à Google Sheets : l'analyse des photos
+    n'a besoin que de cette clé. Les coupler ferait échouer l'analyse dès que
+    le classeur est inaccessible, alors que les deux services sont
+    indépendants."""
+    try:
+        return st.secrets["GEMINI_API_KEY"]
+    except Exception as exc:
+        raise RuntimeError(
+            "La clé Gemini est introuvable dans les secrets de l'application. "
+            "Vérifie qu'une ligne `GEMINI_API_KEY = \"...\"` existe bien dans les secrets "
+            "(⋮ → Settings → Secrets sur Streamlit Cloud), puis redémarre l'application."
+        ) from exc
+
+
 def get_clients(sheet_principale_id: str):
     """Récupère la feuille de calcul à CHAQUE appel (volontairement PAS mise
     en cache) : si on gardait l'objet Worksheet en mémoire, un onglet
@@ -498,7 +515,7 @@ def get_clients(sheet_principale_id: str):
     erreur 'No grid with id ...' jusqu'au redémarrage. Cet appel API est
     rapide et peu coûteux vu la fréquence d'utilisation de l'app."""
     gc = get_gspread_client()
-    api_key = st.secrets["GEMINI_API_KEY"]
+    api_key = get_gemini_key()
     feuille_principale = gc.open_by_key(sheet_principale_id).get_worksheet(0)
     return api_key, feuille_principale
 
@@ -571,6 +588,32 @@ def encoder_image(fichier) -> tuple[str, str]:
     contenu = fichier.read()
     fichier.seek(0)  # remis à zéro : le fichier peut être relu ensuite (st.image, etc.)
     return base64.b64encode(contenu).decode("utf-8"), mime_type
+
+
+def decrire_erreur(exc: Exception) -> str:
+    """Produit un message toujours exploitable, clé API masquée.
+
+    Certaines exceptions ne portent aucun texte : gspread lève par exemple
+    SpreadsheetNotFound sans argument, ce qui affichait « Erreur : » suivi de
+    rien du tout. On retombe alors sur le type de l'exception, complété d'une
+    explication quand la cause est connue."""
+    texte = masquer_cle_api(str(exc)).strip()
+    if texte:
+        return texte
+
+    nom = type(exc).__name__
+    explications = {
+        "SpreadsheetNotFound": (
+            "classeur Google Sheets introuvable. Vérifie l'identifiant configuré dans "
+            "⚙️ Paramètres et que la feuille est bien partagée avec le compte de service."
+        ),
+        "WorksheetNotFound": (
+            "onglet introuvable dans le classeur. Vérifie son nom dans ⚙️ Paramètres."
+        ),
+        "APIError": "Google a refusé la requête. Vérifie les droits d'accès au classeur.",
+    }
+    detail = explications.get(nom)
+    return f"{nom} — {detail}" if detail else f"{nom} (aucun détail fourni par le service)."
 
 
 def masquer_cle_api(texte: str) -> str:
@@ -1234,7 +1277,8 @@ def message_erreur_sheets(exc: Exception) -> str:
             "Trop de requêtes envoyées à Google Sheets en peu de temps. Patiente une minute "
             "puis réessaie."
         )
-    return texte
+    # Filet de sécurité : certaines exceptions gspread n'ont aucun message.
+    return decrire_erreur(exc)
 
 
 def normaliser_libelle(texte: str) -> str:
@@ -1875,7 +1919,7 @@ else:
             if st.button("🔍 Analyser le lot (5 rapports)", type="primary"):
                 with st.spinner("Analyse Gemini des 5 rapports en cours..."):
                     try:
-                        api_key, _ = get_clients_config()
+                        api_key = get_gemini_key()
                         resultats_lot = []
                         for idx_f, f in enumerate(fichiers):
                             try:
@@ -1900,14 +1944,14 @@ else:
                                         donnees["periode_hebdo"] = periode_semaine_courante()
                                 resultats_lot.append(donnees)
                             except Exception as e:
-                                resultats_lot.append({"erreur": masquer_cle_api(str(e))})
+                                resultats_lot.append({"erreur": decrire_erreur(e)})
 
                         ordre = calculer_ordre_chronologique(resultats_lot)
                         st.session_state.ordre_chronologique = ordre
                         st.session_state.lot_donnees = [resultats_lot[j] for j in ordre]
                         st.rerun()
                     except Exception as e:
-                        st.error(f"🚨 Erreur lors de la connexion : {masquer_cle_api(str(e))}")
+                        st.error(f"🚨 Erreur lors de la connexion : {decrire_erreur(e)}")
             st.stop()
 
         # ============================================================
@@ -2014,7 +2058,7 @@ else:
                             ):
                                 with st.spinner("Analyse de la photo ajoutée..."):
                                     try:
-                                        api_key, _ = get_clients_config()
+                                        api_key = get_gemini_key()
                                         image_b64, mime_type = encoder_image(fichier_combler)
                                         res_json = appeler_gemini(api_key, image_b64, mime_type)
                                         donnees_comblees = extraire_donnees(res_json)
@@ -2037,7 +2081,7 @@ else:
                                                 f"{fin_trou.strftime('%d/%m/%y')}). Vérifie que c'est la bonne photo."
                                             )
                                     except Exception as e:
-                                        st.error(f"🚨 Erreur lors de l'analyse : {masquer_cle_api(str(e))}")
+                                        st.error(f"🚨 Erreur lors de l'analyse : {decrire_erreur(e)}")
                         with col_ignorer:
                             if st.button(
                                 "⏭️ Enregistrer sans cette période",
