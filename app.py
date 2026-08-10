@@ -354,6 +354,7 @@ def charger_config() -> dict:
     defaut = {
         "sheet_principale_id": SHEET_PRINCIPALE_ID_DEFAUT,
         "nom_onglet_depenses": NOM_ONGLET_DEPENSES_DEFAUT,
+        "nom_onglet_rapport": "",
         "emails_partage_rapport": "",
         "nom_utilisateur": "Pascal",
     }
@@ -1160,27 +1161,44 @@ def mettre_en_forme_rapport(feuille, nb_lignes_total: int, premiere_ligne_synthe
 NOM_ONGLET_RAPPORT = "Rapport {mois:02d}-{annee}"
 
 
+def nom_onglet_rapport_cible(rapport: dict) -> str:
+    """Nom de l'onglet où écrire le rapport mensuel : celui choisi dans
+    ⚙️ Paramètres s'il est renseigné, sinon un nom automatique par mois."""
+    choisi = (st.session_state.config.get("nom_onglet_rapport") or "").strip()
+    return choisi or NOM_ONGLET_RAPPORT.format(mois=rapport["mois"], annee=rapport["annee"])
+
+
 def creer_rapport_mensuel_onglet(rapport: dict, remplacer: bool = False) -> dict:
-    """Crée le récapitulatif du mois comme NOUVEL ONGLET du classeur configuré.
+    """Écrit le récapitulatif du mois dans un onglet du classeur configuré.
 
     C'est la méthode recommandée : le fichier appartient au client (ou à toi),
     pas au compte de service. Ce dernier ne dispose d'aucun espace de stockage
     Drive et ne peut donc pas être propriétaire d'un fichier ; il peut en
-    revanche ajouter un onglet à un classeur qu'on lui a partagé."""
+    revanche écrire dans un classeur qu'on lui a partagé."""
     classeur = get_gspread_client().open_by_key(st.session_state.config["sheet_principale_id"])
-    nom_onglet = NOM_ONGLET_RAPPORT.format(mois=rapport["mois"], annee=rapport["annee"])
+    nom_onglet = nom_onglet_rapport_cible(rapport)
+    lignes, premiere_ligne_synthese = construire_lignes_rapport(rapport)
 
     existant = next((f for f in classeur.worksheets() if f.title == nom_onglet), None)
+
     if existant is not None:
         if not remplacer:
             raise RuntimeError(
                 f"L'onglet « {nom_onglet} » existe déjà dans ce classeur. "
-                "Coche la case de remplacement si tu veux le regénérer."
+                "Coche la case de remplacement si tu veux y réécrire le rapport."
             )
-        classeur.del_worksheet(existant)
+        # On vide l'onglet plutôt que de le supprimer : sa position dans le
+        # classeur est conservée, ce qui compte quand c'est l'utilisateur qui
+        # l'a créé et placé lui-même.
+        feuille = existant
+        feuille.clear()
+        feuille.resize(
+            rows=max(len(lignes) + 10, feuille.row_count),
+            cols=max(6, feuille.col_count),
+        )
+    else:
+        feuille = classeur.add_worksheet(title=nom_onglet, rows=max(len(lignes) + 10, 50), cols=6)
 
-    lignes, premiere_ligne_synthese = construire_lignes_rapport(rapport)
-    feuille = classeur.add_worksheet(title=nom_onglet, rows=max(len(lignes) + 10, 50), cols=6)
     feuille.update(f"A1:C{len(lignes)}", lignes, value_input_option=VALUE_INPUT_OPTION)
     mettre_en_forme_rapport(feuille, len(lignes), premiere_ligne_synthese)
 
@@ -1696,10 +1714,46 @@ if st.session_state.page == "⚙️ Paramètres":
 
     st.subheader("Rapport mensuel autonome")
     st.caption(
-        "Chaque mois, l'app peut créer un classeur Google Sheets dédié « Rapport mensuel (MM/AAAA) ». "
-        "Ce classeur est créé par le compte de service, qui en reste propriétaire : sans partage, "
-        "**personne d'autre ne pourrait l'ouvrir**. Indique donc les adresses Gmail qui doivent y "
-        "avoir accès (la tienne, celle du client…), séparées par des virgules."
+        "Onglet où l'app écrit le tableau récapitulatif du mois (dépenses datées + synthèse). "
+        "**C'est un réglage distinct de l'onglet des dépenses ci-dessus** : celui-ci reçoit un "
+        "tableau généré de A à Z, l'autre complète le tableau existant du client."
+    )
+
+    nom_rapport_actuel = st.session_state.config.get("nom_onglet_rapport", "")
+    mode_auto = st.checkbox(
+        "Nommer automatiquement l'onglet par mois (Rapport 04-2026, Rapport 05-2026…)",
+        value=not nom_rapport_actuel,
+        help="Décoche pour écrire systématiquement dans un onglet précis que tu as créé toi-même.",
+    )
+
+    if mode_auto:
+        nouveau_nom_rapport = ""
+        st.caption("→ Un onglet distinct sera créé pour chaque mois traité.")
+    elif onglets_dispo:
+        index_rapport = onglets_dispo.index(nom_rapport_actuel) if nom_rapport_actuel in onglets_dispo else 0
+        nouveau_nom_rapport = st.selectbox(
+            "Onglet du rapport mensuel",
+            options=onglets_dispo,
+            index=index_rapport,
+        )
+        if nouveau_nom_rapport == nouvel_onglet_depenses:
+            st.warning(
+                "⚠️ Cet onglet est aussi celui des dépenses. Le rapport mensuel effacerait le "
+                "tableau du client pour le remplacer par le récapitulatif. Choisis-en un autre."
+            )
+    else:
+        nouveau_nom_rapport = st.text_input(
+            "Onglet du rapport mensuel",
+            value=nom_rapport_actuel,
+            placeholder="Nom exact de l'onglet",
+            help="Utilise « Lister les onglets de ce classeur » plus haut pour choisir dans la liste réelle.",
+        )
+
+    st.markdown("**Option de secours : classeur séparé**")
+    st.caption(
+        "Uniquement si tu utilises la création d'un classeur dédié (déconseillée : le compte de "
+        "service n'ayant pas de stockage Drive, elle échoue dans la plupart des cas). Ce classeur "
+        "lui appartiendrait, il faut donc indiquer avec qui le partager."
     )
     nouveaux_emails = st.text_input(
         "Adresses avec qui partager le rapport mensuel",
@@ -1712,6 +1766,7 @@ if st.session_state.page == "⚙️ Paramètres":
             "nom_utilisateur": nouveau_nom.strip() or "Pascal",
             "sheet_principale_id": extraire_id_depuis_url(nouveau_principale),
             "nom_onglet_depenses": nouvel_onglet_depenses.strip() or NOM_ONGLET_DEPENSES_DEFAUT,
+            "nom_onglet_rapport": nouveau_nom_rapport.strip(),
             "emails_partage_rapport": nouveaux_emails.strip(),
         }
         sauvegarder_config(st.session_state.config)
@@ -2431,7 +2486,7 @@ else:
             st.divider()
             st.markdown("### 📗 Créer le rapport mensuel récapitulatif")
 
-            nom_onglet_prevu = NOM_ONGLET_RAPPORT.format(mois=rapport["mois"], annee=rapport["annee"])
+            nom_onglet_prevu = nom_onglet_rapport_cible(rapport)
             lignes_apercu, _ = construire_lignes_rapport(rapport)
 
             if st.session_state.rapport_mensuel_cree:
@@ -2452,7 +2507,7 @@ else:
                     st.rerun()
             else:
                 st.caption(
-                    f"Un onglet **{nom_onglet_prevu}** sera ajouté au classeur configuré, contenant le "
+                    f"Le rapport sera écrit dans l'onglet **{nom_onglet_prevu}** du classeur, avec le "
                     "détail daté des dépenses puis la synthèse du mois (jours travaillés, recette "
                     "totale, dépenses totales, solde net)."
                 )
