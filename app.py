@@ -199,9 +199,14 @@ FEUILLE_DE_STYLE = """
 }
 
 /* --- Tableaux et éditeurs --- */
+/* Pas de `overflow: hidden` ici : la barre d'outils du tableau (ajout et
+   suppression de lignes) flotte au-dessus du coin supérieur droit et serait
+   rognée, rendant la suppression native inaccessible. */
 [data-testid="stDataFrame"], [data-testid="stTable"] {
     border-radius: 10px;
-    overflow: hidden;
+}
+[data-testid="stElementToolbar"] {
+    z-index: 10;
 }
 
 /* --- Titres --- */
@@ -1479,52 +1484,6 @@ def nettoyer_lignes_editeur(lignes: list, champs: list) -> list:
     return resultat
 
 
-def libelle_ligne(ligne: dict, champs: list) -> str:
-    """Description courte d'une ligne, pour la liste de suppression."""
-    montant = ligne.get("montant")
-    montant_txt = "—" if valeur_vide(montant) else f"{formater_montant(float(montant))} FCFA"
-    if "titre" in champs:
-        date_txt = "" if valeur_vide(ligne.get("date")) else f" — {ligne.get('date')}"
-        return f"{ligne.get('titre') or 'Dépense'} · {montant_txt}{date_txt}"
-    date_txt = "sans date" if valeur_vide(ligne.get("date")) else str(ligne.get("date"))
-    return f"{date_txt} · {montant_txt}"
-
-
-def bloc_suppression(indice_semaine: int, champ: str, lignes: list, champs: list, libelle: str) -> None:
-    """Suppression de lignes présentée dans un volet replié : elle n'occupe
-    aucun espace tant que l'utilisateur n'en a pas besoin, et le tableau reste
-    lisible avec ses seules colonnes utiles."""
-    if not lignes:
-        return
-
-    with st.expander(f"🗑️ Supprimer des lignes ({libelle})"):
-        selection = st.multiselect(
-            "Lignes à supprimer",
-            options=list(range(len(lignes))),
-            format_func=lambda position: libelle_ligne(lignes[position], champs),
-            key=f"selection_suppr_{champ}_{indice_semaine}",
-            label_visibility="collapsed",
-            placeholder="Choisir une ou plusieurs lignes…",
-        )
-        if st.button(
-            f"Supprimer {len(selection)} ligne(s)" if selection else "Supprimer",
-            disabled=not selection,
-            use_container_width=True,
-            key=f"bouton_suppr_{champ}_{indice_semaine}",
-        ):
-            conservees = [ligne for position, ligne in enumerate(lignes) if position not in selection]
-            # La liste conservée devient la nouvelle base du tableau, et l'état
-            # interne du widget est effacé : sans cela, Streamlit réappliquerait
-            # ses anciennes modifications à des lignes qui n'existent plus.
-            st.session_state.donnees_filtrees[indice_semaine][champ] = conservees
-            st.session_state.donnees_editees.pop(indice_semaine, None)
-            st.session_state.pop(f"editeur_{champ}_{indice_semaine}", None)
-            st.session_state.pop(f"selection_suppr_{champ}_{indice_semaine}", None)
-            st.session_state.semaines_validees.discard(indice_semaine)
-            st.toast(f"{len(selection)} ligne(s) supprimée(s).")
-            st.rerun()
-
-
 def normaliser_lignes_editeur(valeur) -> list:
     """Convertit ce que renvoie st.data_editor en une liste de dictionnaires.
     Selon le type d'entrée, Streamlit renvoie un DataFrame ou une liste : on
@@ -2291,8 +2250,10 @@ else:
                     )
                     st.caption(
                         "🖊️ Corrige librement ce que l'IA a mal lu : modifie une date ou un montant, "
-                        "ajoute une ligne oubliée via la dernière ligne du tableau. Pour retirer une "
-                        "ligne, ouvre « 🗑️ Supprimer des lignes » sous le tableau concerné."
+                        "ou ajoute une ligne oubliée via la dernière ligne du tableau. "
+                        "Pour supprimer une ligne, survole-la et coche la case qui apparaît tout à "
+                        "gauche, puis clique sur l'icône 🗑️ en haut à droite du tableau (ou appuie "
+                        "sur la touche Suppr)."
                     )
 
                     lecture_seule = st.session_state.bilan_etabli
@@ -2312,8 +2273,6 @@ else:
                     recettes_editees = nettoyer_lignes_editeur(
                         normaliser_lignes_editeur(recettes_editees), CHAMPS_RECETTES
                     )
-                    if not lecture_seule:
-                        bloc_suppression(i, "recettes", recettes_editees, CHAMPS_RECETTES, "recettes")
 
                     st.write("**Dépenses (mois confirmé uniquement)**")
                     depenses_editees = st.data_editor(
@@ -2331,8 +2290,6 @@ else:
                     depenses_editees = nettoyer_lignes_editeur(
                         normaliser_lignes_editeur(depenses_editees), CHAMPS_DEPENSES
                     )
-                    if not lecture_seule:
-                        bloc_suppression(i, "depenses", depenses_editees, CHAMPS_DEPENSES, "dépenses")
 
                 memoriser_donnees_semaine(i, recettes_editees, depenses_editees)
 
