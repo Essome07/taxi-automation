@@ -1447,6 +1447,64 @@ def reinitialiser_lot() -> None:
             del st.session_state[cle]
 
 
+COLONNE_SUPPRESSION = "🗑️"
+CHAMPS_RECETTES = ["date", "montant"]
+CHAMPS_DEPENSES = ["titre", "montant", "date"]
+
+
+def valeur_vide(valeur) -> bool:
+    """Une cellule est considérée vide si elle n'a jamais été renseignée.
+    Streamlit convertit les tableaux en DataFrame : une case laissée blanche
+    peut arriver sous forme de None, de NaN ou de la chaîne « None »."""
+    if valeur is None:
+        return True
+    if isinstance(valeur, float) and valeur != valeur:  # NaN
+        return True
+    return str(valeur).strip() in ("", "None", "nan", "NaT")
+
+
+def ligne_vide(ligne: dict, champs: list) -> bool:
+    return all(valeur_vide(ligne.get(champ)) for champ in champs)
+
+
+def preparer_lignes_editeur(lignes: list, champs: list) -> list:
+    """Ajoute la colonne de sélection utilisée pour la suppression."""
+    return [
+        {COLONNE_SUPPRESSION: False, **{champ: ligne.get(champ) for champ in champs}}
+        for ligne in lignes
+    ]
+
+
+def nettoyer_lignes_editeur(lignes: list, champs: list, retirer_cochees: bool = False) -> list:
+    """Retire la colonne technique de sélection, les lignes entièrement vides
+    (notamment la ligne blanche que Streamlit ajoute en bas du tableau) et,
+    si demandé, les lignes cochées pour suppression."""
+    resultat = []
+    for ligne in lignes:
+        if retirer_cochees and bool(ligne.get(COLONNE_SUPPRESSION)):
+            continue
+        propre = {champ: ligne.get(champ) for champ in champs}
+        if ligne_vide(propre, champs):
+            continue
+        resultat.append(propre)
+    return resultat
+
+
+def supprimer_lignes_selectionnees(indice_semaine: int, champ: str, lignes_editees: list, champs: list) -> int:
+    """Applique la suppression demandée par l'utilisateur.
+
+    La nouvelle liste devient la base de départ du tableau, et l'état interne
+    du widget est effacé : sans cela, Streamlit réappliquerait ses anciennes
+    modifications sur des lignes qui n'existent plus."""
+    conservees = nettoyer_lignes_editeur(lignes_editees, champs, retirer_cochees=True)
+    nb_supprimees = len(nettoyer_lignes_editeur(lignes_editees, champs)) - len(conservees)
+
+    st.session_state.donnees_filtrees[indice_semaine][champ] = conservees
+    st.session_state.donnees_editees.pop(indice_semaine, None)
+    st.session_state.pop(f"editeur_{champ}_{indice_semaine}", None)
+    return nb_supprimees
+
+
 def normaliser_lignes_editeur(valeur) -> list:
     """Convertit ce que renvoie st.data_editor en une liste de dictionnaires.
     Selon le type d'entrée, Streamlit renvoie un DataFrame ou une liste : on
@@ -2212,17 +2270,21 @@ else:
                         f"{fin_mois.strftime('%d/%m/%y')}) sont pris en compte ci-dessous."
                     )
                     st.caption(
-                        "🖊️ Corrige librement ce que l'IA a mal lu : tu peux modifier une date ou un "
-                        "montant, ajouter une ligne oubliée, ou supprimer une ligne en trop."
+                        "🖊️ Corrige librement ce que l'IA a mal lu : modifie une date ou un montant, "
+                        "ajoute une ligne oubliée via la dernière ligne du tableau, ou coche la case "
+                        "🗑️ des lignes à retirer puis clique sur le bouton de suppression."
                     )
 
                     lecture_seule = st.session_state.bilan_etabli
 
                     st.write("**Recettes journalières (mois confirmé uniquement)**")
                     recettes_editees = st.data_editor(
-                        donnees_initiales_semaine(i, "recettes"),
+                        preparer_lignes_editeur(donnees_initiales_semaine(i, "recettes"), CHAMPS_RECETTES),
                         num_rows="dynamic",
                         column_config={
+                            COLONNE_SUPPRESSION: st.column_config.CheckboxColumn(
+                                "🗑️", help="Coche les lignes à supprimer, puis clique sur le bouton en dessous.", width="small"
+                            ),
                             "date": st.column_config.TextColumn("Date (JJ/MM/AA)", required=True),
                             "montant": st.column_config.NumberColumn("Montant (FCFA)", required=True, step=500),
                         },
@@ -2230,12 +2292,28 @@ else:
                         disabled=lecture_seule,
                         key=f"editeur_recettes_{i}",
                     )
+                    recettes_editees = normaliser_lignes_editeur(recettes_editees)
+                    nb_cochees_r = sum(1 for l in recettes_editees if bool(l.get(COLONNE_SUPPRESSION)))
+                    if not lecture_seule and st.button(
+                        f"🗑️ Supprimer les {nb_cochees_r} ligne(s) cochée(s)" if nb_cochees_r
+                        else "🗑️ Supprimer les lignes cochées",
+                        disabled=nb_cochees_r == 0,
+                        use_container_width=True,
+                        key=f"suppr_recettes_{i}",
+                    ):
+                        n = supprimer_lignes_selectionnees(i, "recettes", recettes_editees, CHAMPS_RECETTES)
+                        st.session_state.semaines_validees.discard(i)
+                        st.toast(f"{n} ligne(s) de recettes supprimée(s).")
+                        st.rerun()
 
                     st.write("**Dépenses (mois confirmé uniquement)**")
                     depenses_editees = st.data_editor(
-                        donnees_initiales_semaine(i, "depenses"),
+                        preparer_lignes_editeur(donnees_initiales_semaine(i, "depenses"), CHAMPS_DEPENSES),
                         num_rows="dynamic",
                         column_config={
+                            COLONNE_SUPPRESSION: st.column_config.CheckboxColumn(
+                                "🗑️", help="Coche les lignes à supprimer, puis clique sur le bouton en dessous.", width="small"
+                            ),
                             "titre": st.column_config.TextColumn("Titre de la dépense", required=True),
                             "montant": st.column_config.NumberColumn("Montant (FCFA)", required=True, step=500),
                             "date": st.column_config.TextColumn("Date (JJ/MM/AA)", required=False),
@@ -2244,9 +2322,24 @@ else:
                         disabled=lecture_seule,
                         key=f"editeur_depenses_{i}",
                     )
+                    depenses_editees = normaliser_lignes_editeur(depenses_editees)
+                    nb_cochees_d = sum(1 for l in depenses_editees if bool(l.get(COLONNE_SUPPRESSION)))
+                    if not lecture_seule and st.button(
+                        f"🗑️ Supprimer les {nb_cochees_d} ligne(s) cochée(s)" if nb_cochees_d
+                        else "🗑️ Supprimer les lignes cochées",
+                        disabled=nb_cochees_d == 0,
+                        use_container_width=True,
+                        key=f"suppr_depenses_{i}",
+                    ):
+                        n = supprimer_lignes_selectionnees(i, "depenses", depenses_editees, CHAMPS_DEPENSES)
+                        st.session_state.semaines_validees.discard(i)
+                        st.toast(f"{n} ligne(s) de dépenses supprimée(s).")
+                        st.rerun()
 
-                recettes_editees = normaliser_lignes_editeur(recettes_editees)
-                depenses_editees = normaliser_lignes_editeur(depenses_editees)
+                # Les lignes vides et la colonne technique de sélection ne doivent
+                # jamais atteindre les calculs du bilan.
+                recettes_editees = nettoyer_lignes_editeur(recettes_editees, CHAMPS_RECETTES)
+                depenses_editees = nettoyer_lignes_editeur(depenses_editees, CHAMPS_DEPENSES)
                 memoriser_donnees_semaine(i, recettes_editees, depenses_editees)
 
                 if not recettes_editees:
