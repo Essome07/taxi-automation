@@ -52,10 +52,13 @@ FEUILLE_DE_STYLE = """
 <style>
 :root {
     --accent: #E8A33D;
-    --accent-doux: rgba(232, 163, 61, 0.14);
-    --fond-carte: #1C1F26;
-    --bordure: rgba(255, 255, 255, 0.08);
-    --texte-doux: rgba(232, 230, 227, 0.62);
+    --accent-doux: rgba(232, 163, 61, 0.16);
+    /* Couleurs volontairement translucides : elles se posent sur le fond du
+       thème actif et restent donc lisibles en mode clair comme en mode sombre,
+       sans qu'il faille dupliquer toute la feuille de style. */
+    --fond-carte: rgba(128, 128, 128, 0.10);
+    --bordure: rgba(128, 128, 128, 0.28);
+    --texte-doux: rgba(128, 128, 128, 1);
 }
 
 /* Masque les vignettes natives du file_uploader : la revue visuelle
@@ -129,7 +132,7 @@ FEUILLE_DE_STYLE = """
     justify-content: center;
     width: 22px; height: 22px;
     border-radius: 50%;
-    background: rgba(255, 255, 255, 0.07);
+    background: rgba(128, 128, 128, 0.18);
     font-size: 0.76rem;
     font-weight: 700;
 }
@@ -140,10 +143,11 @@ FEUILLE_DE_STYLE = """
     font-weight: 600;
 }
 .fil-etapes .etape.active .puce { background: var(--accent); color: #14161A; }
-.fil-etapes .etape.faite { color: rgba(232, 230, 227, 0.85); }
+.fil-etapes .etape.active { color: inherit; }
+.fil-etapes .etape.faite { color: inherit; opacity: 0.85; }
 .fil-etapes .etape.faite .puce {
-    background: rgba(232, 163, 61, 0.35);
-    color: #F4E7D0;
+    background: rgba(232, 163, 61, 0.40);
+    color: inherit;
 }
 
 /* --- Cartes de semaines (aperçu du lot) --- */
@@ -163,7 +167,7 @@ FEUILLE_DE_STYLE = """
 }
 .carte-semaine .vignette {
     height: 108px;
-    background: rgba(255, 255, 255, 0.04);
+    background: rgba(128, 128, 128, 0.10);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -185,17 +189,17 @@ FEUILLE_DE_STYLE = """
     padding: 3px 8px;
     border-radius: 999px;
     display: inline-block;
-    background: rgba(255, 255, 255, 0.06);
+    background: rgba(128, 128, 128, 0.16);
     color: var(--texte-doux);
 }
 .carte-semaine .statut.ok {
     background: var(--accent-doux);
-    color: #F4E7D0;
+    color: inherit;
     font-weight: 600;
 }
 .carte-semaine .statut.souci {
-    background: rgba(220, 90, 90, 0.18);
-    color: #F0BDBD;
+    background: rgba(220, 90, 90, 0.20);
+    color: #C0392B;
 }
 
 /* --- Tableaux et éditeurs --- */
@@ -327,23 +331,6 @@ LIGNE_RECETTES_MENSUEL = 4
 LIGNE_DEPENSES_MENSUEL = 5
 LIGNE_SOLDE_MENSUEL = 6
 
-# --- Onglet "Expenses" de la feuille du client ---
-# Structure observée : colonne A = nom de la rubrique, colonne C = intitulé du
-# poste de dépense, colonnes D+ = un mois chacune. Les lignes dont la colonne C
-# vaut "Monthly totals:" sont des lignes de TOTAUX (formules) : l'app ne doit
-# jamais écrire dedans.
-NOM_ONGLET_DEPENSES_DEFAUT = "Expenses"
-COL_RUBRIQUE_DEPENSES = 1   # A
-COL_POSTE_DEPENSES = 3      # C
-LIBELLE_TOTAUX_MENSUELS = "monthly totals"
-
-# Rubriques récurrentes (mois après mois) : privilégiées lors de l'appariement
-# automatique, au détriment des rubriques ponctuelles (achat du taxi, lancement).
-PRIORITE_RUBRIQUES = {
-    "depenses fixes": 0,
-    "depenses diverses": 1,
-}
-
 VALUE_INPUT_OPTION = "USER_ENTERED"  # évite que Sheets force les nombres en texte (bug de l'apostrophe)
 
 
@@ -353,7 +340,6 @@ VALUE_INPUT_OPTION = "USER_ENTERED"  # évite que Sheets force les nombres en te
 def charger_config() -> dict:
     defaut = {
         "sheet_principale_id": SHEET_PRINCIPALE_ID_DEFAUT,
-        "nom_onglet_depenses": NOM_ONGLET_DEPENSES_DEFAUT,
         "nom_onglet_rapport": "",
         "emails_partage_rapport": "",
         "nom_utilisateur": "Pascal",
@@ -530,22 +516,6 @@ def get_clients_config():
     """Raccourci qui lit l'identifiant depuis la config utilisateur en session."""
     config = st.session_state.config
     return get_clients(config["sheet_principale_id"])
-
-
-def get_onglet(nom_onglet: str):
-    """Ouvre un onglet précis (par son nom) du classeur du client.
-    Lève une erreur explicite si l'onglet n'existe pas, plutôt que l'erreur
-    gspread brute peu compréhensible pour l'utilisateur."""
-    gc = get_gspread_client()
-    classeur = gc.open_by_key(st.session_state.config["sheet_principale_id"])
-    try:
-        return classeur.worksheet(nom_onglet)
-    except gspread.WorksheetNotFound:
-        onglets = ", ".join(f"« {f.title} »" for f in classeur.worksheets())
-        raise RuntimeError(
-            f"L'onglet « {nom_onglet} » est introuvable dans le classeur du client. "
-            f"Onglets disponibles : {onglets}. Corrige le nom dans ⚙️ Paramètres."
-        )
 
 
 # ============================================================
@@ -1303,109 +1273,6 @@ def message_erreur_sheets(exc: Exception) -> str:
     return decrire_erreur(exc)
 
 
-def normaliser_libelle(texte: str) -> str:
-    """Minuscules, sans accents, sans ponctuation : permet de rapprocher
-    « Vidange » (feuille du client) de « vidange » ou « VIDANGE » (lu par l'IA
-    sur un rapport manuscrit)."""
-    texte = unicodedata.normalize("NFD", str(texte or ""))
-    texte = "".join(c for c in texte if unicodedata.category(c) != "Mn")
-    return re.sub(r"[^a-z0-9]+", " ", texte.lower()).strip()
-
-
-def lire_structure_depenses(feuille) -> dict:
-    """Analyse l'onglet Expenses et en extrait la structure réelle :
-    les rubriques (colonne A) et, pour chacune, la liste des postes de
-    dépense (colonne C) avec leur numéro de ligne.
-    Les lignes « Monthly totals: » servent de séparateurs de rubrique et
-    sont exclues des destinations possibles (ce sont des formules)."""
-    valeurs = feuille.get_all_values()
-    rubriques = []
-    rubrique_courante = None
-
-    for numero_ligne, ligne in enumerate(valeurs, start=1):
-        col_a = ligne[COL_RUBRIQUE_DEPENSES - 1].strip() if len(ligne) >= COL_RUBRIQUE_DEPENSES else ""
-        col_c = ligne[COL_POSTE_DEPENSES - 1].strip() if len(ligne) >= COL_POSTE_DEPENSES else ""
-
-        if normaliser_libelle(col_c).startswith(LIBELLE_TOTAUX_MENSUELS):
-            rubrique_courante = {
-                "nom": col_a or f"Rubrique (ligne {numero_ligne})",
-                "ligne_totaux": numero_ligne,
-                "postes": [],
-            }
-            rubriques.append(rubrique_courante)
-        elif col_c and rubrique_courante is not None:
-            rubrique_courante["postes"].append({"ligne": numero_ligne, "nom": col_c})
-
-    return {"rubriques": rubriques, "valeurs": valeurs}
-
-
-def lister_postes(structure: dict) -> list:
-    """Aplatit la structure en une liste de destinations possibles."""
-    postes = []
-    for rubrique in structure["rubriques"]:
-        for poste in rubrique["postes"]:
-            postes.append({
-                "ligne": poste["ligne"],
-                "nom": poste["nom"],
-                "rubrique": rubrique["nom"],
-            })
-    return postes
-
-
-def priorite_rubrique(nom_rubrique: str) -> int:
-    return PRIORITE_RUBRIQUES.get(normaliser_libelle(nom_rubrique), 9)
-
-
-def trouver_appariement_auto(titre_depense: str, postes: list):
-    """Propose la ligne la plus plausible pour une dépense du bilan.
-    En cas d'homonymes dans plusieurs rubriques (ex. « Assurance » existe à la
-    fois en dépenses de lancement et en dépenses fixes), on privilégie les
-    rubriques récurrentes. Renvoie None si rien de convaincant."""
-    cible = normaliser_libelle(titre_depense)
-    if not cible:
-        return None
-
-    exacts = [p for p in postes if normaliser_libelle(p["nom"]) == cible]
-    if exacts:
-        return min(exacts, key=lambda p: priorite_rubrique(p["rubrique"]))
-
-    partiels = [
-        p for p in postes
-        if cible in normaliser_libelle(p["nom"]) or normaliser_libelle(p["nom"]) in cible
-    ]
-    if partiels:
-        return min(
-            partiels,
-            key=lambda p: (priorite_rubrique(p["rubrique"]), len(normaliser_libelle(p["nom"]))),
-        )
-
-    return None
-
-
-def valeur_actuelle_cellule(structure: dict, ligne: int, mois: int) -> str:
-    """Contenu actuellement affiché dans la cellule visée (pour prévenir
-    l'utilisateur qu'une écriture va écraser une valeur existante)."""
-    colonne = mois + OFFSET_COLONNE_MOIS
-    valeurs = structure["valeurs"]
-    if ligne - 1 < len(valeurs):
-        ligne_valeurs = valeurs[ligne - 1]
-        if colonne - 1 < len(ligne_valeurs):
-            return ligne_valeurs[colonne - 1].strip()
-    return ""
-
-
-def ecrire_depenses_client(feuille, montants_par_ligne: dict, mois: int) -> None:
-    """Écrit, en une seule requête, les montants dans la colonne du mois.
-    montants_par_ligne : {numero_de_ligne: montant}."""
-    lettre_col = numero_colonne_vers_lettre(mois + OFFSET_COLONNE_MOIS)
-    donnees = [
-        {"range": f"{lettre_col}{ligne}", "values": [[montant]]}
-        for ligne, montant in sorted(montants_par_ligne.items())
-    ]
-    if donnees:
-        feuille.batch_update(donnees, value_input_option=VALUE_INPUT_OPTION)
-
-
 # ============================================================
 # ÉTAT DE SESSION
 # ============================================================
@@ -1424,8 +1291,6 @@ for cle, defaut in {
     "fichiers_combles": {},
     "ordre_chronologique": None,
     "ordre_upload_estime": None,
-    "structure_depenses": None,
-    "depenses_ecrites": False,
     "semaines_validees": set(),
     "bilan_etabli": False,
     "rapport_fige": None,
@@ -1457,8 +1322,6 @@ def reinitialiser_lot() -> None:
     st.session_state.fichiers_combles = {}
     st.session_state.ordre_chronologique = None
     st.session_state.ordre_upload_estime = None
-    st.session_state.structure_depenses = None
-    st.session_state.depenses_ecrites = False
     st.session_state.semaines_validees = set()
     st.session_state.bilan_etabli = False
     st.session_state.rapport_fige = None
@@ -1627,154 +1490,25 @@ if st.session_state.page == "⚙️ Paramètres":
     st.subheader("Préférences")
     nouveau_nom = st.text_input("Ton prénom (utilisé dans la salutation)", value=st.session_state.config["nom_utilisateur"])
 
-    st.subheader("Fichier Google Sheets du client")
     st.caption(
-        "Le plus fiable est de choisir directement dans la liste des classeurs déjà partagés "
-        "avec le compte de service : cela évite toute erreur d'identifiant. Tu peux sinon coller "
-        "l'URL complète du fichier, ou son identifiant."
-    )
-
-    if st.button("📂 Lister les classeurs partagés avec le compte de service"):
-        with st.spinner("Interrogation de Google Drive..."):
-            try:
-                st.session_state.classeurs_accessibles = lister_classeurs_accessibles()
-            except Exception as e:
-                st.session_state.classeurs_accessibles = []
-                st.error(f"🚨 {message_erreur_sheets(e)}")
-
-    classeurs = st.session_state.get("classeurs_accessibles")
-    if classeurs:
-        options = {f["id"]: f.get("name", "(sans nom)") for f in classeurs}
-        ids = list(options.keys())
-        id_actuel = st.session_state.config["sheet_principale_id"]
-        index_defaut = ids.index(id_actuel) if id_actuel in ids else 0
-        choix_classeur = st.selectbox(
-            "Classeurs accessibles",
-            options=ids,
-            format_func=lambda i: f"{options[i]}  ({i[:12]}…)",
-            index=index_defaut,
-        )
-        if st.button("✅ Utiliser ce classeur"):
-            st.session_state.config["sheet_principale_id"] = choix_classeur
-            sauvegarder_config(st.session_state.config)
-            st.session_state.structure_depenses = None
-            st.session_state.onglets_classeur = None  # liste obsolète : autre classeur
-            st.success(f"✅ Classeur « {options[choix_classeur]} » sélectionné.")
-            st.rerun()
-    elif classeurs == []:
-        st.warning(
-            "⚠️ Aucun classeur n'est actuellement partagé avec le compte de service. "
-            "Partage d'abord la feuille avec l'adresse indiquée plus bas."
-        )
-
-    nouveau_principale = st.text_input(
-        "Classeur du client (identifiant ou URL)",
-        value=st.session_state.config["sheet_principale_id"],
-    )
-    st.markdown("**Onglet du tableau de dépenses du client** *(optionnel)*")
-    st.caption(
-        "⚠️ À ne pas confondre avec l'onglet du rapport mensuel. Ce réglage ne sert QUE si le "
-        "client possède déjà un tableau de dépenses structuré (rubriques en colonne A, postes "
-        "en colonne C, lignes « Monthly totals: », un mois par colonne) que l'app doit "
-        "compléter. Pour le rapport récapitulatif, l'onglet se choisit directement sur la page "
+        "Le classeur de destination se choisit désormais directement sur la page "
         "📊 Bilan mensuel, au moment de l'écriture."
     )
 
-    if st.button("📑 Lister les onglets de ce classeur"):
-        with st.spinner("Lecture des onglets..."):
-            try:
-                st.session_state.onglets_classeur = lister_onglets_classeur(
-                    st.session_state.config["sheet_principale_id"]
-                )
-            except Exception as e:
-                st.session_state.onglets_classeur = []
-                st.error(f"🚨 {message_erreur_sheets(e)}")
-
-    onglets_dispo = st.session_state.get("onglets_classeur")
-    onglet_actuel = st.session_state.config.get("nom_onglet_depenses", NOM_ONGLET_DEPENSES_DEFAUT)
-
-    if onglets_dispo:
-        index_defaut = onglets_dispo.index(onglet_actuel) if onglet_actuel in onglets_dispo else 0
-        nouvel_onglet_depenses = st.selectbox(
-            "Onglet des dépenses",
-            options=onglets_dispo,
-            index=index_defaut,
-        )
-        if onglet_actuel not in onglets_dispo:
-            st.warning(
-                f"⚠️ L'onglet actuellement configuré (« {onglet_actuel} ») n'existe pas dans ce "
-                "classeur. Sélectionne le bon ci-dessus, puis enregistre les paramètres."
-            )
-    else:
-        if onglets_dispo == []:
-            st.warning("⚠️ Aucun onglet n'a pu être lu. Vérifie d'abord l'accès au classeur.")
-        nouvel_onglet_depenses = st.text_input(
-            "Nom de l'onglet des dépenses",
-            value=onglet_actuel,
-            help="Utilise le bouton ci-dessus pour choisir dans la liste réelle des onglets.",
-        )
-
-    st.subheader("Rapport mensuel récapitulatif")
+    st.subheader("Apparence")
     st.caption(
-        "Onglet où l'app écrit le tableau récapitulatif du mois (dépenses datées + synthèse). "
-        "Ce réglage ne définit que la **valeur proposée par défaut** : l'onglet reste modifiable "
-        "au dernier moment, directement sur la page 📊 Bilan mensuel."
-    )
-
-    nom_rapport_actuel = st.session_state.config.get("nom_onglet_rapport", "")
-    mode_auto = st.checkbox(
-        "Nommer automatiquement l'onglet par mois (Rapport 04-2026, Rapport 05-2026…)",
-        value=not nom_rapport_actuel,
-        help="Décoche pour écrire systématiquement dans un onglet précis que tu as créé toi-même.",
-    )
-
-    if mode_auto:
-        nouveau_nom_rapport = ""
-        st.caption("→ Un onglet distinct sera créé pour chaque mois traité.")
-    elif onglets_dispo:
-        index_rapport = onglets_dispo.index(nom_rapport_actuel) if nom_rapport_actuel in onglets_dispo else 0
-        nouveau_nom_rapport = st.selectbox(
-            "Onglet du rapport mensuel",
-            options=onglets_dispo,
-            index=index_rapport,
-        )
-        if nouveau_nom_rapport == nouvel_onglet_depenses:
-            st.warning(
-                "⚠️ Cet onglet est aussi celui des dépenses. Le rapport mensuel effacerait le "
-                "tableau du client pour le remplacer par le récapitulatif. Choisis-en un autre."
-            )
-    else:
-        nouveau_nom_rapport = st.text_input(
-            "Onglet du rapport mensuel",
-            value=nom_rapport_actuel,
-            placeholder="Nom exact de l'onglet",
-            help="Utilise « Lister les onglets de ce classeur » plus haut pour choisir dans la liste réelle.",
-        )
-
-    st.markdown("**Option de secours : classeur séparé**")
-    st.caption(
-        "Uniquement si tu utilises la création d'un classeur dédié (déconseillée : le compte de "
-        "service n'ayant pas de stockage Drive, elle échoue dans la plupart des cas). Ce classeur "
-        "lui appartiendrait, il faut donc indiquer avec qui le partager."
-    )
-    nouveaux_emails = st.text_input(
-        "Adresses avec qui partager le rapport mensuel",
-        value=st.session_state.config.get("emails_partage_rapport", ""),
-        placeholder="moi@gmail.com, client@gmail.com",
+        "L'application suit le thème choisi dans Streamlit. Pour passer du mode sombre au mode "
+        "clair : menu **⋮** en haut à droite → **Settings** → **Theme** → *Light* ou *Dark*. "
+        "Ce réglage agit sur toute l'interface, y compris les tableaux."
     )
 
     if st.button("💾 Enregistrer les paramètres", type="primary"):
         st.session_state.config = {
+            **st.session_state.config,
             "nom_utilisateur": nouveau_nom.strip() or "Pascal",
-            "sheet_principale_id": extraire_id_depuis_url(nouveau_principale),
-            "nom_onglet_depenses": nouvel_onglet_depenses.strip() or NOM_ONGLET_DEPENSES_DEFAUT,
-            "nom_onglet_rapport": nouveau_nom_rapport.strip(),
-            "emails_partage_rapport": nouveaux_emails.strip(),
         }
         sauvegarder_config(st.session_state.config)
-        st.session_state.structure_depenses = None
-        st.session_state.onglets_classeur = None  # l'ID du classeur a pu changer
-        st.success("✅ Paramètres enregistrés. Ils seront utilisés pour tous les prochains rapports.")
+        st.success("✅ Paramètres enregistrés.")
 
     st.divider()
     st.subheader("🔐 Accès à la feuille du client")
@@ -1849,35 +1583,8 @@ if st.session_state.page == "⚙️ Paramètres":
                     titres = [f.title for f in classeur.worksheets()]
                     st.write("**Onglets trouvés :** " + ", ".join(f"`{t}`" for t in titres))
 
-                    onglet_attendu = st.session_state.config.get("nom_onglet_depenses", NOM_ONGLET_DEPENSES_DEFAUT)
-                    if onglet_attendu in titres:
-                        st.success(f"✅ L'onglet des dépenses « {onglet_attendu} » est bien présent.")
-                    else:
-                        st.error(
-                            f"🚨 L'onglet des dépenses « {onglet_attendu} » est introuvable. "
-                            "Corrige son nom ci-dessus (orthographe et majuscules doivent correspondre exactement)."
-                        )
                 except Exception as e:
                     st.error(f"🚨 Lecture des onglets impossible : {message_erreur_sheets(e)}")
-
-    st.divider()
-    st.subheader("Quelle clé Gemini l'app utilise-t-elle réellement ?")
-    st.caption(
-        "Utile après un changement de clé API : confirme que l'app a bien pris en compte "
-        "la nouvelle clé (sans jamais afficher la clé en entier)."
-    )
-    if st.button("🔑 Afficher les derniers caractères de la clé chargée"):
-        try:
-            cle_active = st.secrets["GEMINI_API_KEY"]
-            masque = f"{cle_active[:6]}...{cle_active[-4:]} (longueur : {len(cle_active)} caractères)"
-            st.info(f"Clé actuellement chargée par l'app : `{masque}`")
-            st.caption(
-                "Compare ces derniers caractères avec ceux de ta nouvelle clé dans Google AI Studio. "
-                "S'ils ne correspondent pas, l'app utilise encore l'ancienne clé : il faut mettre à jour "
-                "le secret puis redémarrer/redéployer l'application."
-            )
-        except Exception as e:
-            st.error(f"🚨 Impossible de lire la clé configurée : {e}")
 
 # ============================================================
 # PAGE : MAINTENANCE
@@ -1964,8 +1671,6 @@ else:
             st.session_state.rapport_fige = None
             st.session_state.donnees_editees = {}
             st.session_state.rapport_mensuel_cree = None
-            st.session_state.structure_depenses = None
-            st.session_state.depenses_ecrites = False
 
     fichiers = st.session_state.fichiers_lot
 
@@ -2475,8 +2180,6 @@ else:
                     st.session_state.bilan_etabli = False
                     st.session_state.rapport_fige = None
                     st.session_state.semaines_validees = set()
-                    st.session_state.structure_depenses = None
-                    st.session_state.depenses_ecrites = False
                     st.session_state.bilan_enregistre = False
                     st.session_state.rapport_mensuel_cree = None
                     st.session_state.sous_page = 0
@@ -2511,6 +2214,56 @@ else:
                 st.caption(
                     "Le rapport contient le détail daté des dépenses puis la synthèse du mois "
                     "(jours travaillés, recette totale, dépenses totales, solde net)."
+                )
+
+                # Classeur ET onglet se choisissent ICI, à l'endroit exact où
+                # l'on déclenche l'écriture : plus rien à régler ailleurs.
+                st.markdown("**Classeur de destination**")
+                col_cls, col_btn = st.columns([3, 1])
+                with col_btn:
+                    if st.button("📂 Lister les classeurs", use_container_width=True, key="lister_classeurs_bilan"):
+                        with st.spinner("Interrogation de Google Drive..."):
+                            try:
+                                st.session_state.classeurs_accessibles = lister_classeurs_accessibles()
+                            except Exception as e:
+                                st.session_state.classeurs_accessibles = []
+                                st.error(f"🚨 {message_erreur_sheets(e)}")
+
+                classeurs_dispo = st.session_state.get("classeurs_accessibles")
+                with col_cls:
+                    if classeurs_dispo:
+                        noms_classeurs = {c["id"]: c.get("name", "(sans nom)") for c in classeurs_dispo}
+                        ids_classeurs = list(noms_classeurs.keys())
+                        id_courant = st.session_state.config["sheet_principale_id"]
+                        index_cls = ids_classeurs.index(id_courant) if id_courant in ids_classeurs else 0
+                        classeur_choisi = st.selectbox(
+                            "Classeur de destination",
+                            options=ids_classeurs,
+                            format_func=lambda i: noms_classeurs[i],
+                            index=index_cls,
+                            label_visibility="collapsed",
+                            key="classeur_cible_rapport",
+                        )
+                    else:
+                        classeur_choisi = st.text_input(
+                            "Classeur de destination",
+                            value=st.session_state.config["sheet_principale_id"],
+                            label_visibility="collapsed",
+                            placeholder="Identifiant ou URL du classeur Google Sheets",
+                            key="classeur_cible_rapport",
+                        )
+
+                classeur_choisi = extraire_id_depuis_url(classeur_choisi)
+                if classeur_choisi and classeur_choisi != st.session_state.config["sheet_principale_id"]:
+                    # Mémorisé pour les prochains lots, sans passer par les Paramètres.
+                    st.session_state.config["sheet_principale_id"] = classeur_choisi
+                    sauvegarder_config(st.session_state.config)
+                    st.session_state.onglets_classeur = None
+                    st.rerun()
+
+                st.caption(
+                    "Clique sur « Lister les classeurs » pour choisir parmi ceux partagés avec le "
+                    "compte de service, ou colle l'identifiant / l'URL du classeur."
                 )
 
                 # Le choix de l'onglet se fait ICI, à l'endroit exact où l'on
@@ -2549,11 +2302,6 @@ else:
                             key="onglet_cible_rapport",
                         )
 
-                if onglet_choisi.strip() == st.session_state.config.get("nom_onglet_depenses", ""):
-                    st.warning(
-                        "⚠️ C'est aussi l'onglet du tableau de dépenses du client : le rapport "
-                        "écraserait ce tableau. Choisis un autre onglet."
-                    )
                 st.caption(
                     f"Onglet ciblé : **{onglet_choisi or nom_onglet_prevu}**. "
                     "Clique sur « Lister les onglets » pour choisir parmi ceux déjà présents dans "
@@ -2605,158 +2353,6 @@ else:
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"🚨 Création impossible : {message_erreur_sheets(e)}")
-
-            # ====================================================
-            # ÉCRITURE DES DÉPENSES DANS L'ONGLET "EXPENSES" DU CLIENT
-            # ====================================================
-            st.divider()
-            st.markdown("### 💸 Enregistrer les dépenses dans la feuille du client")
-            nom_onglet_dep = st.session_state.config.get("nom_onglet_depenses", NOM_ONGLET_DEPENSES_DEFAUT)
-            nom_mois_rapport = NOMS_MOIS[rapport["mois"]]
-            st.caption(
-                f"Onglet ciblé : **{nom_onglet_dep}** — colonne du mois de "
-                f"**{nom_mois_rapport} {rapport['annee']}** "
-                f"(colonne {numero_colonne_vers_lettre(rapport['mois'] + OFFSET_COLONNE_MOIS)})."
-            )
-
-            if not rapport["depenses_par_titre"]:
-                st.info("ℹ️ Aucune dépense à enregistrer pour ce mois.")
-
-            elif st.session_state.structure_depenses is None:
-                st.write(
-                    "L'app va d'abord lire les postes de dépense déjà présents dans la feuille du client, "
-                    "puis te proposer un rapprochement automatique que tu pourras corriger avant écriture."
-                )
-                if st.button("🔗 Lire l'onglet Expenses du client", type="primary"):
-                    with st.spinner("Lecture de la feuille du client en cours..."):
-                        try:
-                            feuille_dep = get_onglet(nom_onglet_dep)
-                            st.session_state.structure_depenses = lire_structure_depenses(feuille_dep)
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"🚨 {message_erreur_sheets(e)}")
-
-            else:
-                structure = st.session_state.structure_depenses
-                postes = lister_postes(structure)
-
-                if not postes:
-                    st.error(
-                        f"🚨 Aucun poste de dépense n'a été trouvé dans l'onglet « {nom_onglet_dep} »."
-                    )
-                    st.info(
-                        "Deux causes possibles :\n\n"
-                        "- **Ce n'est pas le bon onglet** → change-le dans ⚙️ Paramètres "
-                        "(bouton « Lister les onglets de ce classeur »).\n"
-                        "- **L'onglet n'a pas la structure attendue** → les intitulés des postes "
-                        "doivent être en colonne C, et chaque rubrique doit commencer par une ligne "
-                        "contenant « Monthly totals: »."
-                    )
-                    if st.button("🔄 Relire l'onglet"):
-                        st.session_state.structure_depenses = None
-                        st.rerun()
-                    st.stop()
-
-                nb_rubriques = len(structure["rubriques"])
-                st.success(f"✅ Feuille lue : {nb_rubriques} rubrique(s), {len(postes)} poste(s) de dépense disponibles.")
-
-                libelle_par_ligne = {
-                    p["ligne"]: f"{p['rubrique']} › {p['nom']}   (ligne {p['ligne']})"
-                    for p in postes
-                }
-                options_lignes = [None] + [p["ligne"] for p in postes]
-
-                st.markdown("#### Rapprochement des dépenses")
-                st.caption(
-                    "Vérifie la destination proposée pour chaque dépense. Les postes de rubriques "
-                    "récurrentes (dépenses fixes, dépenses diverses) sont privilégiés automatiquement."
-                )
-
-                choix_par_titre = {}
-                for titre, montant in sorted(rapport["depenses_par_titre"].items(), key=lambda x: -x[1]):
-                    auto = trouver_appariement_auto(titre, postes)
-                    index_defaut = options_lignes.index(auto["ligne"]) if auto else 0
-                    marqueur = "✅" if auto else "❓"
-                    choix_par_titre[titre] = st.selectbox(
-                        f"{marqueur} **{titre}** — {formater_montant(montant)} FCFA",
-                        options=options_lignes,
-                        format_func=lambda v: "⏭️ Ne pas enregistrer" if v is None else libelle_par_ligne[v],
-                        index=index_defaut,
-                        key=f"dest_depense_{normaliser_libelle(titre)}",
-                    )
-
-                # Plusieurs dépenses peuvent viser le même poste : on les cumule.
-                montants_par_ligne: dict = {}
-                titres_par_ligne: dict = {}
-                for titre, ligne_cible in choix_par_titre.items():
-                    if ligne_cible is None:
-                        continue
-                    montants_par_ligne[ligne_cible] = montants_par_ligne.get(ligne_cible, 0.0) + rapport["depenses_par_titre"][titre]
-                    titres_par_ligne.setdefault(ligne_cible, []).append(titre)
-
-                st.markdown("#### Aperçu avant écriture")
-                if not montants_par_ligne:
-                    st.warning("⚠️ Aucune dépense n'est actuellement destinée à être écrite.")
-                else:
-                    apercu = []
-                    ecrasements = 0
-                    for ligne_cible, montant in sorted(montants_par_ligne.items()):
-                        actuelle = valeur_actuelle_cellule(structure, ligne_cible, rapport["mois"])
-                        if actuelle:
-                            ecrasements += 1
-                        apercu.append({
-                            "Destination": libelle_par_ligne[ligne_cible],
-                            "Dépense(s)": ", ".join(titres_par_ligne[ligne_cible]),
-                            "Montant à écrire": f"{formater_montant(montant)} FCFA",
-                            "Valeur actuelle": actuelle or "(vide)",
-                        })
-                    st.table(apercu)
-
-                    total_ecrit = sum(montants_par_ligne.values())
-                    non_affectees = rapport["total_depenses"] - total_ecrit
-                    c1, c2 = st.columns(2)
-                    c1.metric("Total qui sera écrit", f"{formater_montant(total_ecrit)} FCFA")
-                    c2.metric("Non affecté", f"{formater_montant(non_affectees)} FCFA")
-
-                    if non_affectees > 0:
-                        st.warning(
-                            f"⚠️ {formater_montant(non_affectees)} FCFA de dépenses ne seront pas écrites "
-                            "(marquées « Ne pas enregistrer »)."
-                        )
-                    if ecrasements:
-                        st.warning(
-                            f"⚠️ {ecrasements} cellule(s) contiennent déjà une valeur pour "
-                            f"{nom_mois_rapport} : elle sera remplacée."
-                        )
-
-                st.divider()
-                if st.session_state.depenses_ecrites:
-                    st.success(f"✅ Les dépenses ont été écrites dans l'onglet « {nom_onglet_dep} ».")
-                    if st.button("🔄 Relire la feuille et recommencer le rapprochement"):
-                        st.session_state.structure_depenses = None
-                        st.session_state.depenses_ecrites = False
-                        st.rerun()
-                else:
-                    col_ecrire, col_relire = st.columns(2)
-                    with col_ecrire:
-                        if st.button(
-                            "💾 Écrire les dépenses dans la feuille du client",
-                            type="primary",
-                            use_container_width=True,
-                            disabled=not montants_par_ligne,
-                        ):
-                            with st.spinner("Écriture dans la feuille du client en cours..."):
-                                try:
-                                    feuille_dep = get_onglet(nom_onglet_dep)
-                                    ecrire_depenses_client(feuille_dep, montants_par_ligne, rapport["mois"])
-                                    st.session_state.depenses_ecrites = True
-                                    st.rerun()
-                                except Exception as e:
-                                    st.error(f"🚨 Erreur lors de l'écriture : {message_erreur_sheets(e)}")
-                    with col_relire:
-                        if st.button("🔄 Relire l'onglet Expenses", use_container_width=True):
-                            st.session_state.structure_depenses = None
-                            st.rerun()
 
             st.divider()
             with st.expander("📄 Enregistrer aussi le résumé (recettes / dépenses / solde) sur le premier onglet"):
