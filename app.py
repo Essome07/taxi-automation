@@ -341,7 +341,6 @@ def charger_config() -> dict:
     defaut = {
         "sheet_principale_id": SHEET_PRINCIPALE_ID_DEFAUT,
         "nom_onglet_rapport": "",
-        "emails_partage_rapport": "",
         "nom_utilisateur": "Pascal",
     }
     if os.path.exists(CONFIG_PATH):
@@ -1033,7 +1032,6 @@ def calculer_bilan_mensuel_agrege(recettes_combinees: list[dict], depenses_combi
 # Reproduit la maquette validée : tableau daté des dépenses,
 # puis bloc de synthèse (jours travaillés, recettes, dépenses, solde).
 # ============================================================
-TITRE_RAPPORT_MENSUEL = "Rapport mensuel ({mois:02d}/{annee})"
 EN_TETES_RAPPORT = ["DATE", "CATÉGORIE", "TOTAL (XAF)"]
 COULEUR_EN_TETE = {"red": 0.60, "green": 0.11, "blue": 0.16}  # bordeaux de la maquette
 
@@ -1176,46 +1174,6 @@ def creer_rapport_mensuel_onglet(rapport: dict, nom_onglet: str = "") -> dict:
         "classeur": classeur.title,
         "url": f"{classeur.url}#gid={feuille.id}",
         "remplace": existant is not None,
-    }
-
-
-def creer_rapport_mensuel_sheets(rapport: dict, emails_partage: list) -> dict:
-    """Crée un classeur Google Sheets dédié au mois, y écrit le récapitulatif
-    mis en forme, puis le partage avec les adresses fournies.
-
-    Le classeur est créé par le compte de service, qui en reste propriétaire :
-    le partage est donc INDISPENSABLE pour que quelqu'un d'autre puisse
-    l'ouvrir. C'est pour cette raison que la fonction refuse de créer un
-    rapport que personne ne pourrait consulter."""
-    if not emails_partage:
-        raise RuntimeError(
-            "Aucune adresse de partage n'est configurée. Le classeur serait créé au nom du "
-            "compte de service et resterait invisible pour toi comme pour le client. "
-            "Renseigne au moins une adresse Gmail dans ⚙️ Paramètres."
-        )
-
-    gc = get_gspread_client()
-    titre = TITRE_RAPPORT_MENSUEL.format(mois=rapport["mois"], annee=rapport["annee"])
-    classeur = gc.create(titre)
-    feuille = classeur.get_worksheet(0)
-
-    lignes, premiere_ligne_synthese = construire_lignes_rapport(rapport)
-    feuille.update(f"A1:C{len(lignes)}", lignes, value_input_option=VALUE_INPUT_OPTION)
-    mettre_en_forme_rapport(feuille, len(lignes), premiere_ligne_synthese)
-
-    partages_reussis, partages_echoues = [], []
-    for email in emails_partage:
-        try:
-            classeur.share(email, perm_type="user", role="writer", notify=False)
-            partages_reussis.append(email)
-        except Exception as e:
-            partages_echoues.append(f"{email} ({e})")
-
-    return {
-        "titre": titre,
-        "url": classeur.url,
-        "partages_reussis": partages_reussis,
-        "partages_echoues": partages_echoues,
     }
 
 
@@ -2196,16 +2154,10 @@ else:
 
             if st.session_state.rapport_mensuel_cree:
                 infos = st.session_state.rapport_mensuel_cree
-                if infos.get("classeur"):
-                    st.success(
-                        f"✅ Onglet « {infos['titre']} » créé dans le classeur « {infos['classeur']} »."
-                    )
-                else:
-                    st.success(f"✅ Classeur « {infos['titre']} » créé.")
-                    if infos.get("partages_reussis"):
-                        st.caption("Partagé avec : " + ", ".join(infos["partages_reussis"]))
-                    if infos.get("partages_echoues"):
-                        st.warning("⚠️ Partage impossible pour : " + " ; ".join(infos["partages_echoues"]))
+                st.success(
+                    f"✅ Rapport écrit dans l'onglet « {infos['titre']} » "
+                    f"du classeur « {infos['classeur']} »."
+                )
                 st.markdown(f"🔗 [Ouvrir le rapport dans Google Sheets]({infos['url']})")
                 if st.button("🔄 Regénérer le rapport de ce mois"):
                     st.session_state.rapport_mensuel_cree = None
@@ -2329,30 +2281,6 @@ else:
                             st.rerun()
                         except Exception as e:
                             st.error(f"🚨 Création impossible : {message_erreur_sheets(e)}")
-
-                with st.expander("⚙️ Créer plutôt un classeur séparé (déconseillé)"):
-                    st.caption(
-                        "Un classeur créé par l'app appartiendrait au compte de service, qui ne dispose "
-                        "d'aucun espace de stockage Google Drive : cette création échoue donc dans la "
-                        "plupart des cas. À n'utiliser que si le compte de service est rattaché à un "
-                        "Google Workspace avec Drive partagé."
-                    )
-                    emails_bruts = st.session_state.config.get("emails_partage_rapport", "")
-                    emails_partage = [e.strip() for e in re.split(r"[,;\s]+", emails_bruts) if e.strip()]
-                    if emails_partage:
-                        st.caption("Serait partagé avec : " + ", ".join(emails_partage))
-                    else:
-                        st.caption("Aucune adresse de partage configurée (⚙️ Paramètres).")
-
-                    if st.button("Tenter la création d'un classeur séparé", disabled=not emails_partage):
-                        with st.spinner("Tentative de création..."):
-                            try:
-                                st.session_state.rapport_mensuel_cree = creer_rapport_mensuel_sheets(
-                                    rapport, emails_partage
-                                )
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"🚨 Création impossible : {message_erreur_sheets(e)}")
 
             st.divider()
             with st.expander("📄 Enregistrer aussi le résumé (recettes / dépenses / solde) sur le premier onglet"):
