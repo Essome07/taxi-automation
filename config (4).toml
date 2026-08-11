@@ -21,4 +21,4 @@ secondaryBackgroundColor = "#FFFFFF"
 textColor = "#1F2124"
 
 [server]
-maxUploadSize = 25                  # 5 photos de rapport : 25 Mo suffisent largement
+maxUploadSize = 10 Mo                 # 5 photos de rapport : 25 Mo suffisent largement
