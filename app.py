@@ -1168,8 +1168,13 @@ def nom_onglet_rapport_cible(rapport: dict) -> str:
     return choisi or NOM_ONGLET_RAPPORT.format(mois=rapport["mois"], annee=rapport["annee"])
 
 
-def creer_rapport_mensuel_onglet(rapport: dict, remplacer: bool = False, nom_onglet: str = "") -> dict:
+def creer_rapport_mensuel_onglet(rapport: dict, nom_onglet: str = "") -> dict:
     """Écrit le récapitulatif du mois dans un onglet du classeur configuré.
+
+    Si l'onglet existe déjà, son contenu est remplacé sans demander
+    confirmation : la destination est choisie juste avant de cliquer, l'écriture
+    est donc toujours délibérée. Google Sheets conserve de toute façon
+    l'historique des versions du classeur en cas de fausse manœuvre.
 
     `nom_onglet` permet de désigner explicitement la destination depuis la page
     du bilan ; à défaut, on retombe sur le réglage des paramètres ou sur le nom
@@ -1181,11 +1186,6 @@ def creer_rapport_mensuel_onglet(rapport: dict, remplacer: bool = False, nom_ong
     existant = next((f for f in classeur.worksheets() if f.title == nom_onglet), None)
 
     if existant is not None:
-        if not remplacer:
-            raise RuntimeError(
-                f"L'onglet « {nom_onglet} » existe déjà dans ce classeur. "
-                "Coche la case de remplacement si tu veux y réécrire le rapport."
-            )
         # On vide l'onglet plutôt que de le supprimer : sa position dans le
         # classeur est conservée, ce qui compte quand c'est l'utilisateur qui
         # l'a créé et placé lui-même.
@@ -2557,7 +2557,8 @@ else:
                 st.caption(
                     f"Onglet ciblé : **{onglet_choisi or nom_onglet_prevu}**. "
                     "Clique sur « Lister les onglets » pour choisir parmi ceux déjà présents dans "
-                    "le classeur, ou saisis un nouveau nom pour créer un onglet."
+                    "le classeur, ou saisis un nouveau nom pour créer un onglet. "
+                    "Si l'onglet existe déjà, son contenu sera remplacé."
                 )
 
                 with st.expander(f"👁️ Aperçu du contenu ({len(lignes_apercu)} lignes)"):
@@ -2565,11 +2566,6 @@ else:
                         {"DATE": l[0], "CATÉGORIE": l[1], "TOTAL (XAF)": l[2]}
                         for l in lignes_apercu[1:]
                     ])
-
-                remplacer_onglet = st.checkbox(
-                    "Remplacer le contenu si l'onglet existe déjà (les données actuelles de cet onglet seront perdues)",
-                    key="remplacer_onglet_rapport",
-                )
 
                 if st.button(
                     "📗 Écrire le rapport dans cet onglet",
@@ -2579,7 +2575,7 @@ else:
                     with st.spinner("Écriture et mise en forme en cours..."):
                         try:
                             st.session_state.rapport_mensuel_cree = creer_rapport_mensuel_onglet(
-                                rapport, remplacer=remplacer_onglet, nom_onglet=onglet_choisi
+                                rapport, nom_onglet=onglet_choisi
                             )
                             st.session_state.onglets_classeur = None
                             st.rerun()
