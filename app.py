@@ -1168,15 +1168,14 @@ def nom_onglet_rapport_cible(rapport: dict) -> str:
     return choisi or NOM_ONGLET_RAPPORT.format(mois=rapport["mois"], annee=rapport["annee"])
 
 
-def creer_rapport_mensuel_onglet(rapport: dict, remplacer: bool = False) -> dict:
+def creer_rapport_mensuel_onglet(rapport: dict, remplacer: bool = False, nom_onglet: str = "") -> dict:
     """Écrit le récapitulatif du mois dans un onglet du classeur configuré.
 
-    C'est la méthode recommandée : le fichier appartient au client (ou à toi),
-    pas au compte de service. Ce dernier ne dispose d'aucun espace de stockage
-    Drive et ne peut donc pas être propriétaire d'un fichier ; il peut en
-    revanche écrire dans un classeur qu'on lui a partagé."""
+    `nom_onglet` permet de désigner explicitement la destination depuis la page
+    du bilan ; à défaut, on retombe sur le réglage des paramètres ou sur le nom
+    automatique du mois."""
     classeur = get_gspread_client().open_by_key(st.session_state.config["sheet_principale_id"])
-    nom_onglet = nom_onglet_rapport_cible(rapport)
+    nom_onglet = (nom_onglet or "").strip() or nom_onglet_rapport_cible(rapport)
     lignes, premiere_ligne_synthese = construire_lignes_rapport(rapport)
 
     existant = next((f for f in classeur.worksheets() if f.title == nom_onglet), None)
@@ -1672,10 +1671,13 @@ if st.session_state.page == "⚙️ Paramètres":
         "Classeur du client (identifiant ou URL)",
         value=st.session_state.config["sheet_principale_id"],
     )
-    st.markdown("**Onglet de destination des dépenses**")
+    st.markdown("**Onglet du tableau de dépenses du client** *(optionnel)*")
     st.caption(
-        "Choisis, parmi les onglets réellement présents dans le classeur sélectionné, celui qui "
-        "contient le tableau des dépenses à compléter."
+        "⚠️ À ne pas confondre avec l'onglet du rapport mensuel. Ce réglage ne sert QUE si le "
+        "client possède déjà un tableau de dépenses structuré (rubriques en colonne A, postes "
+        "en colonne C, lignes « Monthly totals: », un mois par colonne) que l'app doit "
+        "compléter. Pour le rapport récapitulatif, l'onglet se choisit directement sur la page "
+        "📊 Bilan mensuel, au moment de l'écriture."
     )
 
     if st.button("📑 Lister les onglets de ce classeur"):
@@ -1712,11 +1714,11 @@ if st.session_state.page == "⚙️ Paramètres":
             help="Utilise le bouton ci-dessus pour choisir dans la liste réelle des onglets.",
         )
 
-    st.subheader("Rapport mensuel autonome")
+    st.subheader("Rapport mensuel récapitulatif")
     st.caption(
         "Onglet où l'app écrit le tableau récapitulatif du mois (dépenses datées + synthèse). "
-        "**C'est un réglage distinct de l'onglet des dépenses ci-dessus** : celui-ci reçoit un "
-        "tableau généré de A à Z, l'autre complète le tableau existant du client."
+        "Ce réglage ne définit que la **valeur proposée par défaut** : l'onglet reste modifiable "
+        "au dernier moment, directement sur la page 📊 Bilan mensuel."
     )
 
     nom_rapport_actuel = st.session_state.config.get("nom_onglet_rapport", "")
@@ -2507,10 +2509,57 @@ else:
                     st.rerun()
             else:
                 st.caption(
-                    f"Le rapport sera écrit dans l'onglet **{nom_onglet_prevu}** du classeur, avec le "
-                    "détail daté des dépenses puis la synthèse du mois (jours travaillés, recette "
-                    "totale, dépenses totales, solde net)."
+                    "Le rapport contient le détail daté des dépenses puis la synthèse du mois "
+                    "(jours travaillés, recette totale, dépenses totales, solde net)."
                 )
+
+                # Le choix de l'onglet se fait ICI, à l'endroit exact où l'on
+                # déclenche l'écriture : plus besoin d'aller le régler ailleurs.
+                st.markdown("**Onglet de destination**")
+                col_choix, col_liste = st.columns([3, 1])
+                with col_liste:
+                    if st.button("🔄 Lister les onglets", use_container_width=True, key="lister_onglets_bilan"):
+                        with st.spinner("Lecture des onglets..."):
+                            try:
+                                st.session_state.onglets_classeur = lister_onglets_classeur(
+                                    st.session_state.config["sheet_principale_id"]
+                                )
+                            except Exception as e:
+                                st.session_state.onglets_classeur = []
+                                st.error(f"🚨 {message_erreur_sheets(e)}")
+
+                onglets_connus = st.session_state.get("onglets_classeur") or []
+                options_onglets = [nom_onglet_prevu] + [t for t in onglets_connus if t != nom_onglet_prevu]
+
+                with col_choix:
+                    if len(options_onglets) > 1:
+                        onglet_choisi = st.selectbox(
+                            "Onglet de destination",
+                            options=options_onglets,
+                            index=0,
+                            label_visibility="collapsed",
+                            key="onglet_cible_rapport",
+                        )
+                    else:
+                        onglet_choisi = st.text_input(
+                            "Onglet de destination",
+                            value=nom_onglet_prevu,
+                            label_visibility="collapsed",
+                            placeholder="Nom exact de l'onglet",
+                            key="onglet_cible_rapport",
+                        )
+
+                if onglet_choisi.strip() == st.session_state.config.get("nom_onglet_depenses", ""):
+                    st.warning(
+                        "⚠️ C'est aussi l'onglet du tableau de dépenses du client : le rapport "
+                        "écraserait ce tableau. Choisis un autre onglet."
+                    )
+                st.caption(
+                    f"Onglet ciblé : **{onglet_choisi or nom_onglet_prevu}**. "
+                    "Clique sur « Lister les onglets » pour choisir parmi ceux déjà présents dans "
+                    "le classeur, ou saisis un nouveau nom pour créer un onglet."
+                )
+
                 with st.expander(f"👁️ Aperçu du contenu ({len(lignes_apercu)} lignes)"):
                     st.table([
                         {"DATE": l[0], "CATÉGORIE": l[1], "TOTAL (XAF)": l[2]}
@@ -2518,19 +2567,19 @@ else:
                     ])
 
                 remplacer_onglet = st.checkbox(
-                    "Remplacer l'onglet s'il existe déjà (les données actuelles de cet onglet seront perdues)",
+                    "Remplacer le contenu si l'onglet existe déjà (les données actuelles de cet onglet seront perdues)",
                     key="remplacer_onglet_rapport",
                 )
 
                 if st.button(
-                    "📗 Créer l'onglet du rapport mensuel",
+                    "📗 Écrire le rapport dans cet onglet",
                     type="primary",
                     use_container_width=True,
                 ):
-                    with st.spinner("Création de l'onglet et mise en forme en cours..."):
+                    with st.spinner("Écriture et mise en forme en cours..."):
                         try:
                             st.session_state.rapport_mensuel_cree = creer_rapport_mensuel_onglet(
-                                rapport, remplacer=remplacer_onglet
+                                rapport, remplacer=remplacer_onglet, nom_onglet=onglet_choisi
                             )
                             st.session_state.onglets_classeur = None
                             st.rerun()
