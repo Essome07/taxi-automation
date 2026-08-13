@@ -2045,28 +2045,39 @@ def memoriser_donnees_semaine(i: int, recettes, depenses) -> None:
     }
 
 
-def donnees_initiales_semaine(i: int, champ: str) -> list:
-    """Valeur de DÉPART du tableau éditable : toujours les données brutes
-    issues de l'analyse, jamais les données déjà éditées.
+def base_editeur(indice: int, champ: str) -> list:
+    """Valeur de départ du tableau éditable.
 
-    C'est volontaire : st.data_editor applique ses modifications par-dessus la
-    valeur qu'on lui fournit. Si on lui redonnait le résultat déjà modifié, une
-    ligne ajoutée par l'utilisateur serait réappliquée à chaque rechargement et
-    se dupliquerait indéfiniment. En gardant une base fixe, l'affichage reste
-    exact et les corrections sont conservées via l'état interne du widget."""
-    if st.session_state.donnees_filtrees and i in st.session_state.donnees_filtrees:
-        return st.session_state.donnees_filtrees[i][champ]
-    return []
+    st.data_editor applique ses modifications par-dessus la valeur qu'on lui
+    fournit : tant que le widget vit, il faut donc lui redonner la même base,
+    sinon les corrections seraient appliquées deux fois.
+
+    Mais Streamlit efface l'état d'un widget dès qu'il cesse d'être affiché —
+    ce qui arrive à chaque changement de semaine. Au retour, la base d'origine
+    réapparaissait et écrasait les corrections. On détecte ce cas (données
+    éditées présentes alors que le widget n'a plus d'état) pour promouvoir les
+    données corrigées en nouvelle base."""
+    if not st.session_state.donnees_filtrees or indice not in st.session_state.donnees_filtrees:
+        return []
+
+    editees = st.session_state.donnees_editees.get(indice)
+    widget_vivant = f"editeur_{champ}_{indice}" in st.session_state
+
+    if editees is not None and not widget_vivant:
+        st.session_state.donnees_filtrees[indice][champ] = editees[champ]
+
+    return st.session_state.donnees_filtrees[indice][champ]
 
 
-def obtenir_donnees_semaine(i: int, champ: str) -> list:
-    """Renvoie les données de la semaine i telles qu'elles serviront au bilan :
-    la version corrigée par l'utilisateur si la page a déjà été ouverte, sinon
-    les données issues de l'analyse (non modifiées)."""
-    editees = st.session_state.donnees_editees.get(i)
+def obtenir_donnees_semaine(indice: int, champ: str) -> list:
+    """Données de la semaine telles qu'elles serviront au bilan : la version
+    corrigée si la page a été ouverte, sinon celle issue de l'analyse."""
+    editees = st.session_state.donnees_editees.get(indice)
     if editees is not None:
         return editees[champ]
-    return donnees_initiales_semaine(i, champ)
+    if st.session_state.donnees_filtrees and indice in st.session_state.donnees_filtrees:
+        return st.session_state.donnees_filtrees[indice][champ]
+    return []
 
 
 def afficher_bilan_mensuel(rapport: dict) -> None:
@@ -2880,7 +2891,7 @@ else:
 
                     st.write("**Recettes journalières (mois confirmé uniquement)**")
                     recettes_editees = st.data_editor(
-                        donnees_initiales_semaine(i, "recettes"),
+                        base_editeur(i, "recettes"),
                         num_rows="dynamic",
                         column_config={
                             "date": st.column_config.TextColumn("Date (JJ/MM/AA)", required=True),
@@ -2896,7 +2907,7 @@ else:
 
                     st.write("**Dépenses (mois confirmé uniquement)**")
                     depenses_editees = st.data_editor(
-                        donnees_initiales_semaine(i, "depenses"),
+                        base_editeur(i, "depenses"),
                         num_rows="dynamic",
                         column_config={
                             "titre": st.column_config.TextColumn("Titre de la dépense", required=True),
