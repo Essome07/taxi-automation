@@ -1407,6 +1407,254 @@ def convertir_gras(texte: str) -> str:
     return re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", texte)
 
 
+# ============================================================
+# INSTRUCTIONS EN LANGAGE NATUREL
+# ------------------------------------------------------------
+# Le client écrit ce qu'il veut ; l'IA se contente de TRADUIRE sa
+# phrase en une action structurée parmi une liste fermée. L'action
+# est ensuite prévisualisée, puis appliquée par du code ordinaire
+# seulement si l'utilisateur confirme. À aucun moment l'IA ne
+# modifie directement les données ni n'écrit dans Google Sheets.
+# ============================================================
+ACTIONS_AUTORISEES = {
+    "modifier_recette", "modifier_depense",
+    "supprimer_recette", "supprimer_depense",
+    "ajouter_recette", "ajouter_depense",
+    "renommer_depense",
+}
+
+
+def construire_prompt_instruction(instruction: str, apercu_donnees: str) -> str:
+    return f"""Tu traduis une instruction en français en UNE action structurée, pour une
+application de gestion de rapports de taxi. Tu ne fais que traduire : tu n'exécutes rien.
+
+Données actuellement chargées :
+{apercu_donnees}
+
+Instruction de l'utilisateur :
+"{instruction}"
+
+Réponds UNIQUEMENT par un objet JSON, sans texte autour, choisi parmi :
+
+{{"action":"modifier_recette","date":"JJ/MM/AA","montant":<nombre>}}
+{{"action":"modifier_depense","titre":"<titre existant>","date":"JJ/MM/AA ou null","montant":<nombre>}}
+{{"action":"supprimer_recette","date":"JJ/MM/AA"}}
+{{"action":"supprimer_depense","titre":"<titre existant>","date":"JJ/MM/AA ou null"}}
+{{"action":"ajouter_recette","date":"JJ/MM/AA","montant":<nombre>}}
+{{"action":"ajouter_depense","titre":"<titre>","date":"JJ/MM/AA","montant":<nombre>}}
+{{"action":"renommer_depense","ancien_titre":"<titre existant>","nouveau_titre":"<nouveau>"}}
+{{"action":"inconnue","raison":"<pourquoi tu ne peux pas traduire cette demande>"}}
+
+Règles :
+- Les dates s'écrivent toujours JJ/MM/AA (ex : 12/04/26).
+- Les montants sont des nombres sans espace ni devise.
+- Si l'instruction est ambiguë, ne concerne pas ces données, ou demande autre chose
+  que les actions ci-dessus, réponds avec "inconnue" en expliquant brièvement.
+- N'invente jamais une date ou un titre absent des données ci-dessus, sauf pour un ajout."""
+
+
+def apercu_donnees_pour_agent() -> str:
+    """Résumé compact des données chargées, transmis à l'IA pour qu'elle puisse
+    rattacher l'instruction aux bonnes lignes."""
+    morceaux = []
+    for indice in sorted(st.session_state.donnees_filtrees or {}):
+        recettes = obtenir_donnees_semaine(indice, "recettes")
+        depenses = obtenir_donnees_semaine(indice, "depenses")
+        morceaux.append(f"Semaine {indice + 1} :")
+        for r in recettes:
+            morceaux.append(f"  recette {r.get('date')} = {r.get('montant')}")
+        for d in depenses:
+            morceaux.append(f"  dépense « {d.get('titre')} » {d.get('date') or 'sans date'} = {d.get('montant')}")
+    return "\n".join(morceaux) or "(aucune donnée chargée)"
+
+
+def interpreter_instruction(instruction: str) -> dict:
+    """Traduit l'instruction en action structurée via Gemini."""
+    api_key = get_gemini_key()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
+    payload = {
+        "contents": [{"parts": [{"text": construire_prompt_instruction(instruction, apercu_donnees_pour_agent())}]}],
+        "generationConfig": {"temperature": 0, "response_mime_type": "application/json"},
+    }
+    reponse = requests.post(url, json=payload, timeout=60)
+    if reponse.status_code >= 400:
+        message = ""
+        try:
+            message = reponse.json().get("error", {}).get("message", "")
+        except Exception:
+            pass
+        raise RuntimeError(masquer_cle_api(f"Erreur Gemini {reponse.status_code} : {message}"))
+
+    texte = reponse.json()["candidates"][0]["content"]["parts"][0]["text"]
+    texte = re.sub(r"^```(?:json)?|```$", "", texte.strip(), flags=re.MULTILINE).strip()
+    action = json.loads(texte)
+    if action.get("action") not in ACTIONS_AUTORISEES and action.get("action") != "inconnue":
+        return {"action": "inconnue", "raison": "Action non reconnue par l'application."}
+    return action
+
+
+def trouver_ligne(champ: str, criteres: dict):
+    """Localise une ligne dans les données chargées.
+    Renvoie (indice_semaine, position, ligne) ou (None, None, None)."""
+    for indice in sorted(st.session_state.donnees_filtrees or {}):
+        for position, ligne in enumerate(obtenir_donnees_semaine(indice, champ)):
+            if "date" in criteres and criteres["date"]:
+                if parser_date(str(ligne.get("date", ""))) != parser_date(criteres["date"]):
+                    continue
+            if "titre" in criteres and criteres["titre"]:
+                if normaliser_texte(ligne.get("titre", "")) != normaliser_texte(criteres["titre"]):
+                    continue
+            return indice, position, ligne
+    return None, None, None
+
+
+def decrire_action(action: dict) -> str:
+    """Phrase lisible décrivant ce que l'action va faire."""
+    a = action.get("action")
+    if a == "modifier_recette":
+        return f"Remplacer le montant de la recette du {action['date']} par {formater_montant(action['montant'])} FCFA."
+    if a == "modifier_depense":
+        return f"Remplacer le montant de la dépense « {action['titre']} » par {formater_montant(action['montant'])} FCFA."
+    if a == "supprimer_recette":
+        return f"Supprimer la recette du {action['date']}."
+    if a == "supprimer_depense":
+        return f"Supprimer la dépense « {action['titre']} »."
+    if a == "ajouter_recette":
+        return f"Ajouter une recette de {formater_montant(action['montant'])} FCFA au {action['date']}."
+    if a == "ajouter_depense":
+        return f"Ajouter la dépense « {action['titre']} » de {formater_montant(action['montant'])} FCFA au {action['date']}."
+    if a == "renommer_depense":
+        return f"Renommer la dépense « {action['ancien_titre']} » en « {action['nouveau_titre']} »."
+    return action.get("raison", "Instruction non comprise.")
+
+
+def appliquer_action(action: dict) -> tuple:
+    """Exécute l'action sur les données chargées. Renvoie (succès, message)."""
+    a = action.get("action")
+
+    def enregistrer(indice, champ, lignes):
+        st.session_state.donnees_filtrees[indice][champ] = lignes
+        st.session_state.donnees_editees.pop(indice, None)
+        st.session_state.pop(f"editeur_{champ}_{indice}", None)
+        st.session_state.semaines_validees.discard(indice)
+
+    if a in ("modifier_recette", "supprimer_recette"):
+        indice, position, _ = trouver_ligne("recettes", {"date": action.get("date")})
+        if indice is None:
+            return False, f"Aucune recette trouvée au {action.get('date')}."
+        lignes = list(obtenir_donnees_semaine(indice, "recettes"))
+        if a == "modifier_recette":
+            lignes[position] = {**lignes[position], "montant": action["montant"]}
+        else:
+            lignes.pop(position)
+        enregistrer(indice, "recettes", lignes)
+        return True, f"Semaine {indice + 1} mise à jour."
+
+    if a in ("modifier_depense", "supprimer_depense", "renommer_depense"):
+        criteres = ({"titre": action.get("ancien_titre")} if a == "renommer_depense"
+                    else {"titre": action.get("titre"), "date": action.get("date")})
+        indice, position, _ = trouver_ligne("depenses", criteres)
+        if indice is None:
+            cible = criteres.get("titre")
+            return False, f"Aucune dépense « {cible} » trouvée."
+        lignes = list(obtenir_donnees_semaine(indice, "depenses"))
+        if a == "modifier_depense":
+            lignes[position] = {**lignes[position], "montant": action["montant"]}
+        elif a == "renommer_depense":
+            lignes[position] = {**lignes[position], "titre": action["nouveau_titre"]}
+        else:
+            lignes.pop(position)
+        enregistrer(indice, "depenses", lignes)
+        return True, f"Semaine {indice + 1} mise à jour."
+
+    if a in ("ajouter_recette", "ajouter_depense"):
+        date_ajout = parser_date(action.get("date", ""))
+        if date_ajout is None:
+            return False, "La date de l'ajout n'a pas pu être lue."
+        # On rattache l'ajout à la semaine dont la période contient cette date.
+        indice_cible = None
+        for indice in sorted(st.session_state.donnees_filtrees or {}):
+            dates = [parser_date(str(r.get("date", ""))) for r in obtenir_donnees_semaine(indice, "recettes")]
+            dates = [d for d in dates if d]
+            if dates and min(dates) <= date_ajout <= max(dates):
+                indice_cible = indice
+                break
+        if indice_cible is None:
+            indice_cible = min(st.session_state.donnees_filtrees or {0: None})
+
+        champ = "recettes" if a == "ajouter_recette" else "depenses"
+        lignes = list(obtenir_donnees_semaine(indice_cible, champ))
+        if a == "ajouter_recette":
+            lignes.append({"date": action["date"], "montant": action["montant"]})
+        else:
+            lignes.append({"titre": action["titre"], "montant": action["montant"], "date": action["date"]})
+        enregistrer(indice_cible, champ, lignes)
+        return True, f"Ajouté à la semaine {indice_cible + 1}."
+
+    return False, "Instruction non applicable."
+
+
+def zone_instruction_agent() -> None:
+    """Champ où le client formule une demande en français, avec confirmation
+    avant toute modification."""
+    st.markdown("#### 💬 Demander une modification à l'assistant")
+    st.caption(
+        "Écris ta demande en français, par exemple : « la recette du 12/04 est de 20000 », "
+        "« supprime la dépense vidange » ou « renomme videnge en vidange ». "
+        "L'assistant te montrera ce qu'il a compris avant d'appliquer quoi que ce soit."
+    )
+
+    instruction = st.text_input(
+        "Instruction",
+        key="instruction_agent",
+        placeholder="Ex : la recette du 12/04 est de 20000",
+        label_visibility="collapsed",
+    )
+
+    if st.button("🤖 Interpréter", disabled=not instruction.strip()):
+        with st.spinner("L'assistant analyse ta demande..."):
+            try:
+                st.session_state.action_en_attente = interpreter_instruction(instruction)
+            except Exception as exc:
+                st.session_state.action_en_attente = None
+                st.error(f"🚨 {decrire_erreur(exc)}")
+
+    action = st.session_state.get("action_en_attente")
+    if not action:
+        return
+
+    if action.get("action") == "inconnue":
+        afficher_agent([{
+            "niveau": "alerte",
+            "texte": action.get("raison", "Je n'ai pas compris cette demande.")
+                     + " Reformule, ou modifie directement le tableau ci-dessus.",
+        }], titre="Assistant — demande non comprise")
+        if st.button("Fermer", key="fermer_action_inconnue"):
+            st.session_state.action_en_attente = None
+            st.rerun()
+        return
+
+    afficher_agent([{
+        "niveau": "info",
+        "texte": "Voici ce que j'ai compris : " + decrire_action(action),
+    }], titre="Assistant — confirmation requise")
+
+    col_ok, col_non = st.columns(2)
+    with col_ok:
+        if st.button("✅ Appliquer", type="primary", use_container_width=True, key="appliquer_action"):
+            succes, message = appliquer_action(action)
+            st.session_state.action_en_attente = None
+            if succes:
+                st.toast(f"✅ {message}")
+            else:
+                st.session_state.dernier_echec_agent = message
+            st.rerun()
+    with col_non:
+        if st.button("↩️ Annuler", use_container_width=True, key="annuler_action"):
+            st.session_state.action_en_attente = None
+            st.rerun()
+
+
 def nom_onglet_rapport_cible(rapport: dict) -> str:
     """Nom de l'onglet où écrire le rapport mensuel : celui choisi dans
     ⚙️ Paramètres s'il est renseigné, sinon un nom automatique par mois."""
@@ -1527,6 +1775,8 @@ for cle, defaut in {
     "mois_enregistres": None,
     "suivi_erreur": None,
     "suivi_charge": False,
+    "action_en_attente": None,
+    "dernier_echec_agent": None,
     "signature_lot": None,
     "fichiers_lot": None,
     "page": "📤 Nouveau rapport",
@@ -1897,10 +2147,10 @@ else:
             rafraichir_suivi(silencieux=False)
             st.rerun()
 
-    st.write(f"Uploade exactement {MAX_IMAGES_PAR_LOT} rapports hebdomadaires (un mois complet, glisser-déposer possible).")
+    st.write(f"Uploade de 1 à {MAX_IMAGES_PAR_LOT} rapports hebdomadaires (glisser-déposer possible).")
 
     fichiers_uploades = st.file_uploader(
-        f"Sélectionner les {MAX_IMAGES_PAR_LOT} images des rapports",
+        f"Sélectionner les images des rapports (jusqu'à {MAX_IMAGES_PAR_LOT})",
         type=["jpg", "jpeg", "png"],
         accept_multiple_files=True,
         key=f"uploader_{st.session_state.cle_uploader}",
@@ -1910,13 +2160,6 @@ else:
         if len(fichiers_uploades) > MAX_IMAGES_PAR_LOT:
             st.warning(f"⚠️ Maximum {MAX_IMAGES_PAR_LOT} images à la fois. Seules les {MAX_IMAGES_PAR_LOT} premières seront prises en compte.")
             fichiers_uploades = fichiers_uploades[:MAX_IMAGES_PAR_LOT]
-
-        if len(fichiers_uploades) < MAX_IMAGES_PAR_LOT:
-            st.info(
-                f"📸 L'analyse ne se lance qu'à partir d'un lot complet de {MAX_IMAGES_PAR_LOT} rapports "
-                f"hebdomadaires (un mois entier). Il t'en manque {MAX_IMAGES_PAR_LOT - len(fichiers_uploades)}."
-            )
-            st.stop()
 
         signature = tuple((f.name, f.size) for f in fichiers_uploades)
         if st.session_state.signature_lot != signature:
@@ -1979,14 +2222,28 @@ else:
         if st.session_state.lot_donnees is None:
             st.divider()
             st.subheader("🗓️ Étape 1 — Analyse du lot mensuel")
-            st.write("Les 5 rapports vont être lus par l'IA afin d'identifier le mois couvert, avant tout enregistrement.")
+            mot_rapport = "rapport" if total_fichiers == 1 else "rapports"
+            st.write(
+                f"{total_fichiers} {mot_rapport} vont être lus par l'IA afin d'identifier le mois "
+                "couvert, avant tout enregistrement."
+                if total_fichiers > 1 else
+                "Le rapport va être lu par l'IA afin d'identifier le mois couvert, avant tout enregistrement."
+            )
             st.caption(
-                f"Modèle utilisé : `{GEMINI_MODEL}`. Les 5 images sont envoyées avec quelques secondes "
+                f"Modèle utilisé : `{GEMINI_MODEL}`. Les images sont envoyées avec quelques secondes "
                 "d'écart entre chacune pour rester dans les limites du palier gratuit Gemini."
             )
+            if total_fichiers < MAX_IMAGES_PAR_LOT:
+                afficher_agent([{
+                    "niveau": "info",
+                    "texte": f"Ce lot ne contient que **{total_fichiers} {mot_rapport}** sur "
+                             f"{MAX_IMAGES_PAR_LOT} possibles : le bilan ne couvrira que les jours "
+                             "effectivement présents. Tu pourras compléter le mois plus tard en "
+                             "réécrivant le rapport avec les semaines manquantes.",
+                }], titre="Assistant — lot partiel")
 
-            if st.button("🔍 Analyser le lot (5 rapports)", type="primary"):
-                with st.spinner("Analyse Gemini des 5 rapports en cours..."):
+            if st.button(f"🔍 Analyser le lot ({total_fichiers} {mot_rapport})", type="primary"):
+                with st.spinner(f"Analyse Gemini de {total_fichiers} {mot_rapport} en cours..."):
                     try:
                         api_key = get_gemini_key()
                         resultats_lot = []
@@ -2382,6 +2639,16 @@ else:
                 m1.metric("Recettes (mois confirmé)", f"{formater_montant(total_r)} FCFA")
                 m2.metric("Dépenses (mois confirmé)", f"{formater_montant(total_d)} FCFA")
                 m3.metric("Solde", f"{formater_montant(total_r - total_d)} FCFA")
+
+                if not st.session_state.bilan_etabli:
+                    st.divider()
+                    if st.session_state.dernier_echec_agent:
+                        afficher_agent([{
+                            "niveau": "alerte",
+                            "texte": st.session_state.dernier_echec_agent,
+                        }], titre="Assistant — modification impossible")
+                        st.session_state.dernier_echec_agent = None
+                    zone_instruction_agent()
 
                 if not st.session_state.bilan_etabli:
                     st.divider()
