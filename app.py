@@ -401,9 +401,16 @@ def charger_config() -> dict:
     return defaut
 
 
-def sauvegarder_config(config: dict) -> None:
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
+def sauvegarder_config(config: dict) -> bool:
+    """Mémorise la configuration sur disque. Renvoie False si l'écriture est
+    impossible (hébergement en lecture seule) : les réglages restent alors
+    valables pour la session, ce qui ne doit pas faire échouer l'application."""
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
 
 
 def extraire_id_depuis_url(texte: str) -> str:
@@ -706,6 +713,66 @@ def appeler_gemini(api_key: str, image_b64: str, mime_type: str, tentatives: int
         return reponse.json()
 
 
+def valeur_vide(valeur) -> bool:
+    """Une cellule est considérée vide si elle n'a jamais été renseignée.
+    Streamlit convertit les tableaux en DataFrame : une case laissée blanche
+    peut arriver sous forme de None, de NaN ou de la chaîne « None »."""
+    if valeur is None:
+        return True
+    if isinstance(valeur, float) and valeur != valeur:  # NaN
+        return True
+    return str(valeur).strip() in ("", "None", "nan", "NaT")
+
+
+def parser_montant(valeur):
+    """Convertit en nombre un montant qui peut arriver sous des formes variées.
+
+    L'IA lit une écriture manuscrite : elle peut renvoyer 15000, mais aussi
+    « 15000F », « 15 000 » ou « 15.000 ». Un simple float() échouait sur ces
+    formes et le montant était alors compté comme zéro, sans la moindre
+    alerte — le bilan devenait faux de façon invisible.
+
+    Renvoie None si la valeur est vraiment illisible, pour que l'appelant
+    puisse le signaler au lieu de l'ignorer."""
+    if valeur is None:
+        return None
+    if isinstance(valeur, bool):
+        return None
+    if isinstance(valeur, (int, float)):
+        if isinstance(valeur, float) and valeur != valeur:  # NaN
+            return None
+        return float(valeur)
+
+    texte = re.sub(r"[^\d,.\-]", "", str(valeur).strip())
+    if not texte or texte.strip("-.,") == "":
+        return None
+
+    negatif = texte.startswith("-")
+    texte = texte.lstrip("-")
+
+    # Distinguer séparateur de milliers et séparateur décimal : en FCFA les
+    # centimes n'existent pas, un groupe final de 3 chiffres est donc un
+    # séparateur de milliers (« 15.000 » = quinze mille, pas quinze).
+    if "," in texte and "." in texte:
+        if texte.rfind(",") > texte.rfind("."):
+            texte = texte.replace(".", "").replace(",", ".")
+        else:
+            texte = texte.replace(",", "")
+    elif "," in texte:
+        morceaux = texte.split(",")
+        texte = texte.replace(",", "" if len(morceaux[-1]) == 3 else ".")
+    elif "." in texte:
+        morceaux = texte.split(".")
+        if len(morceaux[-1]) == 3:
+            texte = texte.replace(".", "")
+
+    try:
+        montant = float(texte)
+    except ValueError:
+        return None
+    return -montant if negatif else montant
+
+
 def extraire_donnees(res_json: dict) -> dict:
     if "error" in res_json:
         raise RuntimeError(res_json["error"].get("message", "Erreur inconnue de l'API Gemini."))
@@ -717,7 +784,14 @@ def extraire_donnees(res_json: dict) -> dict:
     if candidat.get("finishReason") == "SAFETY":
         raise RuntimeError("La demande a été bloquée par les filtres de sécurité de Gemini.")
 
-    texte = candidat["content"]["parts"][0]["text"]
+    try:
+        texte = candidat["content"]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError):
+        raison = candidat.get("finishReason", "inconnue")
+        raise RuntimeError(
+            f"Gemini a renvoyé une réponse vide (motif : {raison}). "
+            "L'image est peut-être illisible, ou la réponse a été tronquée."
+        )
     texte = re.sub(r"^```(json)?|```$", "", texte.strip(), flags=re.MULTILINE).strip()
 
     try:
@@ -725,10 +799,55 @@ def extraire_donnees(res_json: dict) -> dict:
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"Réponse Gemini invalide (JSON incorrect) : {exc}") from exc
 
-    donnees.setdefault("periode_hebdo", "")
-    donnees.setdefault("recettes_journalieres", [])
-    donnees.setdefault("depenses", [])
-    return donnees
+    if not isinstance(donnees, dict):
+        raise RuntimeError("Réponse Gemini inattendue : un objet était attendu.")
+
+    return normaliser_donnees_extraites(donnees)
+
+
+def normaliser_donnees_extraites(donnees: dict) -> dict:
+    """Met les données lues par l'IA dans une forme sûre et homogène.
+
+    Sans cette étape, un montant renvoyé sous forme de texte (« 15000F ») ou
+    une liste mal typée se propagerait dans tous les calculs. On convertit ici
+    une bonne fois pour toutes, et l'on garde trace des valeurs illisibles."""
+    resultat = {
+        "periode_hebdo": str(donnees.get("periode_hebdo") or "").strip(),
+        "recettes_journalieres": [],
+        "depenses": [],
+    }
+    non_lus = 0
+
+    brut_recettes = donnees.get("recettes_journalieres")
+    if isinstance(brut_recettes, list):
+        for ligne in brut_recettes:
+            if not isinstance(ligne, dict):
+                continue
+            montant = parser_montant(ligne.get("montant"))
+            if montant is None and not valeur_vide(ligne.get("montant")):
+                non_lus += 1
+            resultat["recettes_journalieres"].append({
+                "date": str(ligne.get("date") or "").strip(),
+                "montant": montant if montant is not None else 0,
+            })
+
+    brut_depenses = donnees.get("depenses")
+    if isinstance(brut_depenses, list):
+        for ligne in brut_depenses:
+            if not isinstance(ligne, dict):
+                continue
+            montant = parser_montant(ligne.get("montant"))
+            if montant is None and not valeur_vide(ligne.get("montant")):
+                non_lus += 1
+            resultat["depenses"].append({
+                "titre": str(ligne.get("titre") or "Dépense").strip() or "Dépense",
+                "montant": montant if montant is not None else 0,
+                "date": str(ligne.get("date") or "").strip(),
+            })
+
+    if non_lus:
+        resultat["montants_non_lus"] = non_lus
+    return resultat
 
 
 # ============================================================
@@ -995,20 +1114,18 @@ def formater_montant(valeur: float) -> str:
 def calculer_total_recettes(recettes: list[dict]) -> float:
     total = 0.0
     for r in recettes:
-        try:
-            total += float(r.get("montant", 0) or 0)
-        except (TypeError, ValueError):
-            pass
+        montant = parser_montant(r.get("montant"))
+        if montant is not None:
+            total += montant
     return total
 
 
 def calculer_total_depenses(depenses: list[dict]) -> float:
     total = 0.0
     for d in depenses:
-        try:
-            total += float(d.get("montant", 0) or 0)
-        except (TypeError, ValueError):
-            pass
+        montant = parser_montant(d.get("montant"))
+        if montant is not None:
+            total += montant
     return total
 
 
@@ -1887,17 +2004,6 @@ CHAMPS_RECETTES = ["date", "montant"]
 CHAMPS_DEPENSES = ["titre", "montant", "date"]
 
 
-def valeur_vide(valeur) -> bool:
-    """Une cellule est considérée vide si elle n'a jamais été renseignée.
-    Streamlit convertit les tableaux en DataFrame : une case laissée blanche
-    peut arriver sous forme de None, de NaN ou de la chaîne « None »."""
-    if valeur is None:
-        return True
-    if isinstance(valeur, float) and valeur != valeur:  # NaN
-        return True
-    return str(valeur).strip() in ("", "None", "nan", "NaT")
-
-
 def ligne_vide(ligne: dict, champs: list) -> bool:
     return all(valeur_vide(ligne.get(champ)) for champ in champs)
 
@@ -2395,6 +2501,38 @@ else:
                     "Je confirme que ce n'est pas une erreur : poursuivre quand même malgré le(s) doublon(s) ci-dessus.",
                     key="confirmer_doublon",
                 )
+
+            # Montants que l'IA n'a pas su lire : ils valent 0 pour l'instant et
+            # fausseraient le bilan s'ils passaient inaperçus.
+            total_non_lus = sum(
+                donnees.get("montants_non_lus", 0)
+                for donnees in st.session_state.lot_donnees
+                if isinstance(donnees, dict)
+            )
+            if total_non_lus:
+                st.warning(
+                    f"⚠️ {total_non_lus} montant(s) n'ont pas pu être lus et valent actuellement 0. "
+                    "Corrige-les à l'étape de vérification, sinon le bilan sera sous-évalué."
+                )
+
+            # Valeurs manifestement suspectes, signe d'une lecture erronée.
+            suspects = []
+            for indice, donnees in enumerate(st.session_state.lot_donnees):
+                if not isinstance(donnees, dict) or "erreur" in donnees:
+                    continue
+                for recette in donnees.get("recettes_journalieres", []):
+                    montant = parser_montant(recette.get("montant"))
+                    if montant is None:
+                        continue
+                    if montant < 0:
+                        suspects.append(f"Semaine {indice + 1} : recette négative le {recette.get('date')}")
+                    elif montant > tarif_journalier() * 5:
+                        suspects.append(
+                            f"Semaine {indice + 1} : recette de {formater_montant(montant)} F le "
+                            f"{recette.get('date')}, très au-dessus d'une journée type"
+                        )
+            if suspects:
+                st.warning("⚠️ Valeurs à vérifier :\n\n" + "\n".join(f"- {s}" for s in suspects[:8]))
 
             # --------------------------------------------------------
             # 2) Périodes manquantes : combler avec une photo, ou ignorer
@@ -2922,6 +3060,19 @@ else:
 
             nom_onglet_prevu = nom_onglet_rapport_cible(rapport)
             lignes_apercu, _ = construire_lignes_rapport(rapport)
+
+            # Filet de sécurité : le rapport reste récupérable même si Google
+            # Sheets est indisponible (quota, panne, partage retiré).
+            contenu_csv = "\n".join(
+                ";".join(str(cellule) for cellule in ligne) for ligne in lignes_apercu
+            )
+            st.download_button(
+                "⬇️ Télécharger ce rapport (CSV)",
+                data=contenu_csv.encode("utf-8-sig"),
+                file_name=f"rapport_{NOMS_MOIS[rapport['mois']]}_{rapport['annee']}.csv",
+                mime="text/csv",
+                help="Sauvegarde locale, utile si l'écriture dans Google Sheets échoue.",
+            )
 
             if st.session_state.rapport_mensuel_cree:
                 infos = st.session_state.rapport_mensuel_cree
