@@ -804,24 +804,64 @@ def determiner_bornes_mois(lot_donnees: list[dict]):
     return datetime.date(annee, mois, 1), dernier_jour_du_mois(annee, mois)
 
 
-def detecter_trous_hebdomadaires(lot_donnees: list[dict]) -> list:
-    """Vérifie l'enchaînement des périodes hebdomadaires des rapports du lot
-    et renvoie la liste des trous détectés, sous forme de tuples
-    (debut_manquant, fin_manquant)."""
-    periodes = []
-    for donnees in lot_donnees:
-        if not isinstance(donnees, dict):
-            continue
-        p = parser_periode(donnees.get("periode_hebdo", ""))
-        if p:
-            periodes.append(p)
-    periodes.sort(key=lambda p: p[0])
+def jours_couverts_par_lot(lot_donnees: list[dict]) -> set:
+    """Ensemble des jours effectivement couverts par les rapports du lot.
 
-    trous = []
-    for (debut1, fin1), (debut2, fin2) in zip(periodes, periodes[1:]):
-        if debut2 > fin1 + datetime.timedelta(days=1):
-            trous.append((fin1 + datetime.timedelta(days=1), debut2 - datetime.timedelta(days=1)))
-    return trous
+    On se fie d'abord à la période hebdomadaire lue sur l'image ; si elle est
+    illisible, on retombe sur les dates des recettes journalières."""
+    jours = set()
+    for donnees in lot_donnees:
+        if not isinstance(donnees, dict) or "erreur" in donnees:
+            continue
+        periode = parser_periode(donnees.get("periode_hebdo", ""))
+        if periode:
+            jour, fin = periode
+            while jour <= fin:
+                jours.add(jour)
+                jour += datetime.timedelta(days=1)
+        else:
+            for recette in donnees.get("recettes_journalieres", []):
+                date_jour = parser_date(str(recette.get("date", "")))
+                if date_jour:
+                    jours.add(date_jour)
+    return jours
+
+
+def detecter_periodes_manquantes(lot_donnees: list[dict], debut_mois, fin_mois) -> list:
+    """Périodes du mois qui ne sont couvertes par aucun rapport fourni.
+
+    Contrairement à une simple détection de trous entre deux semaines, on
+    compare ici à l'ensemble des jours du mois : un début ou une fin de mois
+    absents sont donc signalés, tout comme un lot incomplet (2 semaines sur 5).
+    Les jours manquants consécutifs sont regroupés en périodes."""
+    if debut_mois is None or fin_mois is None:
+        return []
+
+    couverts = jours_couverts_par_lot(lot_donnees)
+
+    manquants = []
+    jour = debut_mois
+    while jour <= fin_mois:
+        if jour not in couverts:
+            manquants.append(jour)
+        jour += datetime.timedelta(days=1)
+
+    periodes = []
+    for jour in manquants:
+        if periodes and jour == periodes[-1][1] + datetime.timedelta(days=1):
+            periodes[-1] = (periodes[-1][0], jour)
+        else:
+            periodes.append((jour, jour))
+    return periodes
+
+
+def jours_de_periode(debut, fin) -> list:
+    """Liste des jours d'une période, bornes incluses."""
+    jours, jour = [], debut
+    while jour <= fin:
+        jours.append(jour)
+        jour += datetime.timedelta(days=1)
+    return jours
 
 
 def hachage_fichier(fichier) -> str:
@@ -912,6 +952,8 @@ def detecter_doublons(fichiers: list, lot_donnees: list[dict]) -> list[dict]:
 
     empreintes: dict = {}
     for i, f in enumerate(fichiers):
+        if f is None:  # semaine saisie manuellement : aucune image à comparer
+            continue
         empreintes.setdefault(hachage_fichier(f), []).append(i)
     for indices in empreintes.values():
         if len(indices) > 1:
@@ -2355,31 +2397,56 @@ else:
             # --------------------------------------------------------
             st.divider()
             st.markdown("#### 🗓️ Vérification des périodes manquantes")
-            trous = detecter_trous_hebdomadaires(st.session_state.lot_donnees)
-            trous_a_traiter = [
-                t for t in trous
-                if f"{t[0].isoformat()}_{t[1].isoformat()}" not in st.session_state.trous_ignores
+            periodes_manquantes = detecter_periodes_manquantes(
+                st.session_state.lot_donnees, debut_mois, fin_mois
+            )
+            periodes_a_traiter = [
+                periode for periode in periodes_manquantes
+                if f"{periode[0].isoformat()}_{periode[1].isoformat()}" not in st.session_state.trous_ignores
             ]
 
-            if trous_a_traiter:
-                messages_trous = [{
+            if periodes_a_traiter:
+                jours_manquants = sum(
+                    (fin - debut).days + 1 for debut, fin in periodes_a_traiter
+                )
+                messages_periodes = [{
                     "niveau": "alerte",
-                    "texte": f"Les données de la période du **{debut.strftime('%d/%m')}** au "
-                             f"**{fin.strftime('%d/%m')}** sont manquantes. Veux-tu ajouter la photo "
-                             "correspondante, ou poursuivre sans elle ?",
-                } for debut, fin in trous_a_traiter]
-                afficher_agent(messages_trous, titre="Assistant — semaines manquantes")
+                    "texte": f"Il manque **{jours_manquants} jour(s)** sur le mois de "
+                             f"**{NOMS_MOIS[debut_mois.month]} {debut_mois.year}**.",
+                }]
+                messages_periodes += [{
+                    "niveau": "alerte",
+                    "texte": f"Période manquante : du **{debut.strftime('%d/%m')}** au "
+                             f"**{fin.strftime('%d/%m')}** "
+                             f"({(fin - debut).days + 1} jour(s)).",
+                } for debut, fin in periodes_a_traiter]
+                messages_periodes.append({
+                    "niveau": "info",
+                    "texte": "Pour chacune : charge la photo correspondante, saisis les données à "
+                             "la main, ou poursuis sans elle.",
+                })
+                afficher_agent(messages_periodes, titre="Assistant — périodes manquantes")
 
-                for debut_trou, fin_trou in trous_a_traiter:
+                for debut_trou, fin_trou in periodes_a_traiter:
                     cle_trou = f"{debut_trou.isoformat()}_{fin_trou.isoformat()}"
-                    with st.expander(f"Gérer la période manquante du {debut_trou.strftime('%d/%m/%y')} au {fin_trou.strftime('%d/%m/%y')}"):
-                        fichier_combler = st.file_uploader(
-                            "Ajoute la photo de cette semaine si tu l'as (elle sera vérifiée automatiquement)",
-                            type=["jpg", "jpeg", "png"],
-                            key=f"upload_comblement_{cle_trou}",
+                    with st.expander(
+                        f"Compléter la période du {debut_trou.strftime('%d/%m/%y')} "
+                        f"au {fin_trou.strftime('%d/%m/%y')}"
+                    ):
+                        mode = st.radio(
+                            "Comment veux-tu compléter cette période ?",
+                            ["📷 Charger la photo", "✍️ Saisir les données", "⏭️ Poursuivre sans"],
+                            horizontal=True,
+                            key=f"mode_comblement_{cle_trou}",
                         )
-                        col_verif, col_ignorer = st.columns(2)
-                        with col_verif:
+
+                        # ---- Mode photo ----
+                        if mode == "📷 Charger la photo":
+                            fichier_combler = st.file_uploader(
+                                "Photo du rapport de cette période (elle sera vérifiée automatiquement)",
+                                type=["jpg", "jpeg", "png"],
+                                key=f"upload_comblement_{cle_trou}",
+                            )
                             if st.button(
                                 "🔍 Vérifier et ajouter cette photo",
                                 key=f"verifier_comblement_{cle_trou}",
@@ -2401,33 +2468,100 @@ else:
                                                 getattr(fichier_combler, "type", None),
                                                 fichier_combler.getvalue(),
                                             )
-                                            st.success("✅ Photo ajoutée : elle correspond bien à la période manquante.")
+                                            st.success("✅ Photo ajoutée : elle couvre bien la période manquante.")
                                             st.rerun()
                                         else:
                                             periode_trouvee = donnees_comblees.get("periode_hebdo") or "non détectée"
                                             st.error(
                                                 f"🚨 Cette photo couvre la période « {periode_trouvee} », qui ne "
-                                                f"correspond pas à la période manquante ({debut_trou.strftime('%d/%m/%y')} - "
-                                                f"{fin_trou.strftime('%d/%m/%y')}). Vérifie que c'est la bonne photo."
+                                                f"correspond pas à la période manquante "
+                                                f"({debut_trou.strftime('%d/%m/%y')} - {fin_trou.strftime('%d/%m/%y')}). "
+                                                "Vérifie que c'est la bonne photo."
                                             )
                                     except Exception as e:
                                         st.error(f"🚨 Erreur lors de l'analyse : {decrire_erreur(e)}")
-                        with col_ignorer:
+
+                        # ---- Mode saisie manuelle ----
+                        elif mode == "✍️ Saisir les données":
+                            st.caption(
+                                "Les jours de la période sont pré-remplis. Renseigne les recettes "
+                                "(laisse à 0 un jour non travaillé) et ajoute les dépenses éventuelles."
+                            )
+                            base_recettes = [
+                                {"date": jour.strftime("%d/%m/%y"), "montant": 0}
+                                for jour in jours_de_periode(debut_trou, fin_trou)
+                            ]
+                            recettes_saisies = st.data_editor(
+                                base_recettes,
+                                num_rows="dynamic",
+                                column_config={
+                                    "date": st.column_config.TextColumn("Date (JJ/MM/AA)", required=True),
+                                    "montant": st.column_config.NumberColumn("Recette (FCFA)", required=True, step=500),
+                                },
+                                use_container_width=True,
+                                key=f"saisie_recettes_{cle_trou}",
+                            )
+                            st.caption("Dépenses de la période (facultatif) :")
+                            depenses_saisies = st.data_editor(
+                                [],
+                                num_rows="dynamic",
+                                column_config={
+                                    "titre": st.column_config.TextColumn("Titre de la dépense", required=True),
+                                    "montant": st.column_config.NumberColumn("Montant (FCFA)", required=True, step=500),
+                                    "date": st.column_config.TextColumn("Date (JJ/MM/AA)", required=False),
+                                },
+                                use_container_width=True,
+                                key=f"saisie_depenses_{cle_trou}",
+                            )
+
+                            recettes_propres = nettoyer_lignes_editeur(
+                                normaliser_lignes_editeur(recettes_saisies), CHAMPS_RECETTES
+                            )
+                            depenses_propres = nettoyer_lignes_editeur(
+                                normaliser_lignes_editeur(depenses_saisies), CHAMPS_DEPENSES
+                            )
+                            total_saisi = calculer_total_recettes(recettes_propres)
+                            st.caption(
+                                f"Total saisi : **{formater_montant(total_saisi)} FCFA** de recettes, "
+                                f"**{formater_montant(calculer_total_depenses(depenses_propres))} FCFA** de dépenses."
+                            )
+
                             if st.button(
-                                "⏭️ Enregistrer sans cette période",
+                                "✅ Ajouter ces données au mois",
+                                key=f"valider_saisie_{cle_trou}",
+                                disabled=not recettes_propres,
+                                use_container_width=True,
+                                type="primary",
+                            ):
+                                st.session_state.lot_donnees.append({
+                                    "periode_hebdo": f"{debut_trou.strftime('%d/%m/%y')} - {fin_trou.strftime('%d/%m/%y')}",
+                                    "recettes_journalieres": recettes_propres,
+                                    "depenses": depenses_propres,
+                                    "saisie_manuelle": True,
+                                })
+                                # Aucune photo associée : on mémorise None pour
+                                # conserver l'alignement entre rapports et images.
+                                st.session_state.fichiers_combles[cle_trou] = None
+                                st.success("✅ Données saisies ajoutées au mois.")
+                                st.rerun()
+
+                        # ---- Mode « poursuivre sans » ----
+                        else:
+                            st.caption(
+                                "Cette période sera absente du bilan : les jours concernés ne seront "
+                                "comptés ni en recettes ni en jours travaillés."
+                            )
+                            if st.button(
+                                "⏭️ Poursuivre sans cette période",
                                 key=f"ignorer_comblement_{cle_trou}",
                                 use_container_width=True,
                             ):
                                 st.session_state.trous_ignores.add(cle_trou)
                                 st.rerun()
-                st.caption(
-                    "Pour chaque période manquante ci-dessus : ajoute la photo correspondante (elle sera "
-                    "vérifiée automatiquement avant d'être intégrée), ou choisis d'enregistrer sans elle."
-                )
             else:
-                st.success("✅ Aucune période manquante en attente (comblée ou ignorée).")
+                st.success("✅ Le mois est entièrement couvert (ou les périodes absentes ont été acceptées).")
 
-            tous_les_trous_geres = len(trous_a_traiter) == 0
+            tous_les_trous_geres = len(periodes_a_traiter) == 0
 
             peut_continuer = tous_les_trous_geres and poursuivre_malgre_doublon
 
