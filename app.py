@@ -997,11 +997,91 @@ class FichierMemorise(io.BytesIO):
         self.size = len(contenu)
 
 
-def memoriser_fichiers(fichiers_uploades: list) -> list:
-    return [
-        FichierMemorise(f.name, getattr(f, "type", None), f.getvalue())
-        for f in fichiers_uploades
-    ]
+# ============================================================
+# CONSERVATION DES PHOTOS PAR MOIS
+# ------------------------------------------------------------
+# Le chauffeur envoie une photo par semaine : le client doit pouvoir les
+# déposer au fil de l'eau, et les retrouver à sa visite suivante.
+#
+# Les photos sont écrites sur le disque du serveur. C'est la seule voie
+# possible ici : un compte de service Google ne dispose d'aucun quota de
+# stockage Drive, et reste propriétaire des fichiers qu'il téléverse — même
+# dans un dossier partagé. Cette conservation est donc fiable au fil des
+# jours, mais pas garantie après un redéploiement de l'application.
+# ============================================================
+DOSSIER_PHOTOS = "photos_lots"
+
+
+def dossier_du_mois(annee: int, mois: int) -> str:
+    return os.path.join(DOSSIER_PHOTOS, f"{annee}-{mois:02d}")
+
+
+def enregistrer_photo(annee: int, mois: int, fichier) -> bool:
+    """Conserve une photo dans le dossier du mois. Renvoie False si le disque
+    est en lecture seule : la photo reste alors utilisable pour la session."""
+    try:
+        dossier = dossier_du_mois(annee, mois)
+        os.makedirs(dossier, exist_ok=True)
+        horodatage = datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")
+        nom_sur = re.sub(r"[^\w.\-]", "_", fichier.name)[-60:]
+        chemin = os.path.join(dossier, f"{horodatage}__{nom_sur}")
+        fichier.seek(0)
+        with open(chemin, "wb") as sortie:
+            sortie.write(fichier.read())
+        fichier.seek(0)
+        return True
+    except Exception:
+        return False
+
+
+def lister_photos(annee: int, mois: int) -> list:
+    """Photos déjà déposées pour ce mois, dans leur ordre de dépôt."""
+    dossier = dossier_du_mois(annee, mois)
+    if not os.path.isdir(dossier):
+        return []
+    photos = []
+    for nom in sorted(os.listdir(dossier)):
+        chemin = os.path.join(dossier, nom)
+        try:
+            with open(chemin, "rb") as entree:
+                contenu = entree.read()
+        except Exception:
+            continue
+        nom_affiche = nom.split("__", 1)[-1]
+        fichier = FichierMemorise(nom_affiche, None, contenu)
+        fichier.chemin = chemin
+        photos.append(fichier)
+    return photos
+
+
+def supprimer_photo(chemin: str) -> bool:
+    try:
+        os.remove(chemin)
+        return True
+    except Exception:
+        return False
+
+
+def mois_avec_photos() -> list:
+    """Mois pour lesquels des photos sont conservées, du plus récent au plus
+    ancien, avec leur nombre de photos."""
+    if not os.path.isdir(DOSSIER_PHOTOS):
+        return []
+    resultat = []
+    for nom in os.listdir(DOSSIER_PHOTOS):
+        correspondance = re.fullmatch(r"(\d{4})-(\d{2})", nom)
+        if not correspondance:
+            continue
+        chemin = os.path.join(DOSSIER_PHOTOS, nom)
+        if not os.path.isdir(chemin):
+            continue
+        nombre = len([f for f in os.listdir(chemin) if os.path.isfile(os.path.join(chemin, f))])
+        resultat.append({
+            "annee": int(correspondance.group(1)),
+            "mois": int(correspondance.group(2)),
+            "nombre": nombre,
+        })
+    return sorted(resultat, key=lambda e: (e["annee"], e["mois"]), reverse=True)
 
 
 def estimer_ordre_upload(fichiers: list) -> list:
@@ -2136,7 +2216,7 @@ with st.sidebar:
     st.divider()
     st.session_state.page = st.radio(
         "Navigation",
-        ["📤 Nouveau rapport", "⚙️ Paramètres"],
+        ["📤 Nouveau rapport", "🗂️ Historique", "⚙️ Paramètres"],
         label_visibility="collapsed",
     )
     st.divider()
@@ -2152,7 +2232,62 @@ with st.sidebar:
 # ============================================================
 # PAGE : PARAMÈTRES
 # ============================================================
-if st.session_state.page == "⚙️ Paramètres":
+if st.session_state.page == "🗂️ Historique":
+    st.title("🗂️ Historique")
+    st.caption(
+        "Photos conservées mois par mois, et rapports déjà écrits dans le classeur."
+    )
+
+    if not st.session_state.suivi_charge:
+        with st.spinner("Consultation du classeur..."):
+            rafraichir_suivi()
+        st.session_state.suivi_charge = True
+
+    stock = mois_avec_photos()
+    enregistres = set(st.session_state.mois_enregistres or [])
+    connus = sorted(
+        {(e["annee"], e["mois"]) for e in stock} | enregistres,
+        reverse=True,
+    )
+
+    if not connus:
+        st.info("Aucun mois traité pour l'instant. Dépose tes premières photos depuis 📤 Nouveau rapport.")
+    else:
+        nombres = {(e["annee"], e["mois"]): e["nombre"] for e in stock}
+        st.table([
+            {
+                "Mois": libelle_periode(periode).capitalize(),
+                "Photos conservées": nombres.get(periode, 0),
+                "Rapport écrit": "✅ oui" if periode in enregistres else "—",
+            }
+            for periode in connus
+        ])
+
+        st.divider()
+        st.subheader("Photos d'un mois")
+        periode_vue = st.selectbox(
+            "Mois à consulter",
+            options=connus,
+            format_func=lambda p: libelle_periode(p).capitalize(),
+        )
+        photos = lister_photos(*periode_vue)
+        if not photos:
+            st.caption("Aucune photo conservée pour ce mois.")
+        else:
+            colonnes = st.columns(min(len(photos), 5))
+            for position, photo in enumerate(photos):
+                with colonnes[position % len(colonnes)]:
+                    st.image(photo, use_container_width=True)
+                    st.caption(f"Semaine {position + 1}")
+
+    st.divider()
+    st.caption(
+        "⚠️ Les photos sont conservées sur le serveur de l'application. Elles survivent "
+        "aux fermetures du navigateur, mais peuvent être perdues lors d'une mise à jour "
+        "de l'application. Les rapports écrits dans Google Sheets, eux, sont définitifs."
+    )
+
+elif st.session_state.page == "⚙️ Paramètres":
     st.title("⚙️ Paramètres")
 
     st.subheader("Préférences")
@@ -2311,29 +2446,102 @@ else:
             rafraichir_suivi(silencieux=False)
             st.rerun()
 
-    st.write(f"Uploade de 1 à {MAX_IMAGES_PAR_LOT} rapports hebdomadaires (glisser-déposer possible).")
+    # ------------------------------------------------------------
+    # Dépôt des photos, semaine après semaine
+    # Le chauffeur envoie une photo par semaine : le client les dépose au fur
+    # et à mesure dans le mois concerné, puis lance l'analyse quand il le
+    # souhaite. Les photos déposées sont conservées d'une visite à l'autre.
+    # ------------------------------------------------------------
+    st.subheader("📥 Dépôt des photos du mois")
 
-    fichiers_uploades = st.file_uploader(
-        f"Sélectionner les images des rapports (jusqu'à {MAX_IMAGES_PAR_LOT})",
+    attendue = periode_attendue(st.session_state.mois_enregistres)
+    aujourd_hui = datetime.date.today()
+    defaut = attendue or (aujourd_hui.year, aujourd_hui.month)
+
+    choix_annees = sorted({defaut[0] - 1, defaut[0], defaut[0] + 1, aujourd_hui.year})
+    col_mois, col_annee = st.columns([2, 1])
+    with col_mois:
+        mois_choisi = st.selectbox(
+            "Mois concerné",
+            options=list(range(1, 13)),
+            format_func=lambda m: NOMS_MOIS[m].capitalize(),
+            index=defaut[1] - 1,
+            key="mois_depot",
+        )
+    with col_annee:
+        annee_choisie = st.selectbox(
+            "Année",
+            options=choix_annees,
+            index=choix_annees.index(defaut[0]),
+            key="annee_depot",
+        )
+
+    photos_du_mois = lister_photos(annee_choisie, mois_choisi)
+
+    nouvelles = st.file_uploader(
+        "Ajouter la photo reçue cette semaine (ou plusieurs d'un coup)",
         type=["jpg", "jpeg", "png"],
         accept_multiple_files=True,
         key=f"uploader_{st.session_state.cle_uploader}",
     )
 
-    if fichiers_uploades:
-        if len(fichiers_uploades) > MAX_IMAGES_PAR_LOT:
-            st.warning(f"⚠️ Maximum {MAX_IMAGES_PAR_LOT} images à la fois. Seules les {MAX_IMAGES_PAR_LOT} premières seront prises en compte.")
-            fichiers_uploades = fichiers_uploades[:MAX_IMAGES_PAR_LOT]
+    if nouvelles:
+        place_restante = MAX_IMAGES_PAR_LOT - len(photos_du_mois)
+        if place_restante <= 0:
+            st.warning(
+                f"⚠️ Ce mois contient déjà {MAX_IMAGES_PAR_LOT} photos, le maximum. "
+                "Supprime-en une avant d'en ajouter une autre."
+            )
+        else:
+            a_ajouter = nouvelles[:place_restante]
+            if len(nouvelles) > place_restante:
+                st.warning(
+                    f"⚠️ Seules {place_restante} photo(s) ont été ajoutées : "
+                    f"un mois ne peut en contenir plus de {MAX_IMAGES_PAR_LOT}."
+                )
+            echecs = 0
+            for photo in a_ajouter:
+                if not enregistrer_photo(annee_choisie, mois_choisi, photo):
+                    echecs += 1
+            if echecs:
+                st.error(
+                    f"🚨 {echecs} photo(s) n'ont pas pu être conservées sur le serveur. "
+                    "Elles restent utilisables pour cette session, mais seront perdues en la quittant."
+                )
+            st.session_state.cle_uploader += 1
+            st.rerun()
 
-        signature = tuple((f.name, f.size) for f in fichiers_uploades)
-        if st.session_state.signature_lot != signature:
+    # ---- Photos déjà déposées pour ce mois ----
+    if photos_du_mois:
+        st.markdown(
+            f"**{len(photos_du_mois)} photo(s) déposée(s) pour "
+            f"{NOMS_MOIS[mois_choisi]} {annee_choisie}** "
+            f"(sur {MAX_IMAGES_PAR_LOT} possibles)"
+        )
+        colonnes = st.columns(min(len(photos_du_mois), 5))
+        for position, photo in enumerate(photos_du_mois):
+            with colonnes[position % len(colonnes)]:
+                st.image(photo, use_container_width=True)
+                st.caption(f"Semaine {position + 1}")
+                if st.button("🗑️ Retirer", key=f"retirer_photo_{position}", use_container_width=True):
+                    if supprimer_photo(photo.chemin):
+                        reinitialiser_lot()
+                        st.toast("Photo retirée.")
+                        st.rerun()
+                    else:
+                        st.error("🚨 Suppression impossible.")
+
+        st.divider()
+        if st.button(
+            f"🔍 Lancer l'analyse de ces {len(photos_du_mois)} photo(s)",
+            type="primary",
+            use_container_width=True,
+        ):
             for cle in list(st.session_state.keys()):
                 if cle.startswith("editeur_recettes_") or cle.startswith("editeur_depenses_"):
                     del st.session_state[cle]
-            # Copie en mémoire : le lot doit survivre à un passage par la page
-            # Paramètres, qui vide le file_uploader.
-            st.session_state.fichiers_lot = memoriser_fichiers(fichiers_uploades)
-            st.session_state.signature_lot = signature
+            st.session_state.fichiers_lot = photos_du_mois
+            st.session_state.signature_lot = tuple((p.name, p.size) for p in photos_du_mois)
             st.session_state.lot_donnees = None
             st.session_state.donnees_filtrees = None
             st.session_state.mois_confirme = False
@@ -2341,26 +2549,32 @@ else:
             st.session_state.trous_ignores = set()
             st.session_state.fichiers_combles = {}
             st.session_state.ordre_chronologique = None
-            st.session_state.ordre_upload_estime = estimer_ordre_upload(st.session_state.fichiers_lot)
+            st.session_state.ordre_upload_estime = estimer_ordre_upload(photos_du_mois)
             st.session_state.semaines_validees = set()
             st.session_state.bilan_etabli = False
             st.session_state.rapport_fige = None
             st.session_state.donnees_editees = {}
             st.session_state.rapport_mensuel_cree = None
+            st.rerun()
+    else:
+        afficher_agent([{
+            "niveau": "info",
+            "texte": f"Aucune photo déposée pour **{NOMS_MOIS[mois_choisi]} {annee_choisie}**. "
+                     "Dépose la photo dès que le chauffeur te l'envoie : elle sera conservée "
+                     "jusqu'à ce que le mois soit complet.",
+        }], titre="Assistant — dépôt")
 
     fichiers = st.session_state.fichiers_lot
 
     if fichiers:
-        if not fichiers_uploades:
-            # Retour depuis un autre onglet : le widget est vide, mais le lot
-            # est conservé. On le rappelle pour éviter toute confusion.
-            col_info, col_reset = st.columns([3, 1])
-            with col_info:
-                st.info(f"📂 Lot en cours : {len(fichiers)} photos déjà chargées.")
-            with col_reset:
-                if st.button("🗑️ Changer de lot", use_container_width=True):
-                    reinitialiser_lot()
-                    st.rerun()
+        st.divider()
+        col_info, col_reset = st.columns([3, 1])
+        with col_info:
+            st.info(f"🔎 Analyse en cours sur {len(fichiers)} photo(s).")
+        with col_reset:
+            if st.button("↩️ Revenir au dépôt", use_container_width=True):
+                reinitialiser_lot()
+                st.rerun()
 
         total_fichiers = len(fichiers)
         fichiers_effectifs = [fichiers[j] for j in st.session_state.ordre_upload_estime]
