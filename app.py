@@ -24,6 +24,7 @@ import io
 import json
 import os
 import re
+import tempfile
 import time
 import unicodedata
 
@@ -1009,7 +1010,42 @@ class FichierMemorise(io.BytesIO):
 # dans un dossier partagé. Cette conservation est donc fiable au fil des
 # jours, mais pas garantie après un redéploiement de l'application.
 # ============================================================
-DOSSIER_PHOTOS = "photos_lots"
+def _emplacement_inscriptible() -> str:
+    """Premier emplacement où l'application peut réellement écrire.
+
+    Le dossier de l'application est privilégié : c'est le plus durable. Mais
+    certains hébergements le montent en lecture seule ; on se rabat alors sur
+    le dossier temporaire du système, toujours accessible en écriture, quitte
+    à perdre les photos au redémarrage du serveur."""
+    candidats = [
+        os.path.join(os.getcwd(), "photos_lots"),
+        os.path.join(tempfile.gettempdir(), "taxi_dashboard_photos"),
+    ]
+    for chemin in candidats:
+        try:
+            os.makedirs(chemin, exist_ok=True)
+            temoin = os.path.join(chemin, ".test_ecriture")
+            with open(temoin, "w") as f:
+                f.write("ok")
+            os.remove(temoin)
+            return chemin
+        except Exception:
+            continue
+    return ""
+
+
+DOSSIER_PHOTOS = _emplacement_inscriptible()
+
+
+def stockage_photos_disponible() -> bool:
+    """Vrai si un emplacement d'écriture a pu être trouvé au démarrage."""
+    return bool(DOSSIER_PHOTOS)
+
+
+def stockage_est_temporaire() -> bool:
+    """Vrai si l'on a dû se rabattre sur le dossier temporaire du système :
+    les photos y survivent à la session, mais pas au redémarrage du serveur."""
+    return bool(DOSSIER_PHOTOS) and DOSSIER_PHOTOS.startswith(tempfile.gettempdir())
 
 
 def dossier_du_mois(annee: int, mois: int) -> str:
@@ -2250,6 +2286,19 @@ if st.session_state.page == "🗂️ Historique":
         reverse=True,
     )
 
+    if not stockage_photos_disponible():
+        st.error(
+            "🚨 Aucun emplacement d'écriture n'a été trouvé sur le serveur : les photos ne "
+            "peuvent pas être conservées. Les analyses et les rapports fonctionnent "
+            "normalement, mais il faudra redéposer les photos à chaque session."
+        )
+    elif stockage_est_temporaire():
+        st.info(
+            "ℹ️ Les photos sont conservées dans l'espace temporaire du serveur : elles "
+            "restent disponibles d'une visite à l'autre, mais seront effacées lors d'un "
+            "redémarrage de l'application."
+        )
+
     if not connus:
         st.info("Aucun mois traité pour l'instant. Dépose tes premières photos depuis 📤 Nouveau rapport.")
     else:
@@ -2257,11 +2306,21 @@ if st.session_state.page == "🗂️ Historique":
         st.table([
             {
                 "Mois": libelle_periode(periode).capitalize(),
-                "Photos conservées": nombres.get(periode, 0),
+                "Photos conservées": (
+                    f"{nombres[periode]} photo(s)" if periode in nombres else "aucune"
+                ),
                 "Rapport écrit": "✅ oui" if periode in enregistres else "—",
             }
             for periode in connus
         ])
+
+        mois_sans_photo = [p for p in connus if p in enregistres and p not in nombres]
+        if mois_sans_photo:
+            st.caption(
+                "ℹ️ Les mois marqués « aucune » ont été traités avant la mise en place de la "
+                "conservation des photos : seul leur rapport a été gardé. À partir de maintenant, "
+                "toute photo déposée est conservée."
+            )
 
         st.divider()
         st.subheader("Photos d'un mois")
@@ -2272,7 +2331,10 @@ if st.session_state.page == "🗂️ Historique":
         )
         photos = lister_photos(*periode_vue)
         if not photos:
-            st.caption("Aucune photo conservée pour ce mois.")
+            st.caption(
+                "Aucune photo conservée pour ce mois. Tu peux en déposer depuis "
+                "📤 Nouveau rapport en sélectionnant ce mois."
+            )
         else:
             colonnes = st.columns(min(len(photos), 5))
             for position, photo in enumerate(photos):
@@ -2453,6 +2515,12 @@ else:
     # souhaite. Les photos déposées sont conservées d'une visite à l'autre.
     # ------------------------------------------------------------
     st.subheader("📥 Dépôt des photos du mois")
+
+    if not stockage_photos_disponible():
+        st.warning(
+            "⚠️ Les photos ne pourront pas être conservées entre deux visites : dépose-les "
+            "et lance l'analyse dans la même session."
+        )
 
     attendue = periode_attendue(st.session_state.mois_enregistres)
     aujourd_hui = datetime.date.today()
