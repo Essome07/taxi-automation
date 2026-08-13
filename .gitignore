@@ -1,3 +1,14 @@
+# À ajouter dans le fichier .gitignore de ton dépôt GitHub
+# (crée-le à la racine s'il n'existe pas)
+
+# Secrets — ne doivent JAMAIS être publiés
 credentials.json
+.streamlit/secrets.toml
+
+# Données locales de l'application
+photos_lots/
+config_app.json
+
+# Python
 __pycache__/
-*.jpg
+*.pyc
