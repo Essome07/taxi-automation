@@ -220,6 +220,14 @@ h1, h2, h3 { letter-spacing: -0.01em; }
 st.markdown(FEUILLE_DE_STYLE, unsafe_allow_html=True)
 
 
+def normaliser_texte(texte: str) -> str:
+    """Minuscules, sans accents : permet de reconnaître « Février 2026 » aussi
+    bien que « fevrier 2026 » quand on relit les noms d'onglets d'un classeur."""
+    texte = unicodedata.normalize("NFD", str(texte or ""))
+    texte = "".join(c for c in texte if unicodedata.category(c) != "Mn")
+    return re.sub(r"\s+", " ", texte.lower()).strip()
+
+
 def echapper_html(texte: str) -> str:
     """Neutralise les caractères spéciaux avant insertion dans un bloc HTML
     décoratif (un prénom contenant « & » ou « < » ne doit pas casser la page)."""
@@ -1033,7 +1041,32 @@ def calculer_bilan_mensuel_agrege(recettes_combinees: list[dict], depenses_combi
 # puis bloc de synthèse (jours travaillés, recettes, dépenses, solde).
 # ============================================================
 EN_TETES_RAPPORT = ["DATE", "CATÉGORIE", "TOTAL (XAF)"]
-COULEUR_EN_TETE = {"red": 0.60, "green": 0.11, "blue": 0.16}  # bordeaux de la maquette
+# Une couleur d'en-tête par mois : chaque feuille du classeur est ainsi
+# identifiable d'un coup d'œil. L'index 0 est inutilisé (les mois vont de 1 à 12).
+# La teinte suit les saisons : tons froids en hiver, chauds en été.
+COULEURS_EN_TETE_PAR_MOIS = [
+    None,
+    {"red": 0.16, "green": 0.32, "blue": 0.56},  # janvier   — bleu nuit
+    {"red": 0.31, "green": 0.29, "blue": 0.60},  # février   — indigo
+    {"red": 0.20, "green": 0.45, "blue": 0.42},  # mars      — vert d'eau
+    {"red": 0.22, "green": 0.52, "blue": 0.29},  # avril     — vert feuille
+    {"red": 0.45, "green": 0.55, "blue": 0.20},  # mai       — vert olive
+    {"red": 0.72, "green": 0.55, "blue": 0.13},  # juin      — ocre
+    {"red": 0.80, "green": 0.44, "blue": 0.12},  # juillet   — orange
+    {"red": 0.75, "green": 0.28, "blue": 0.15},  # août      — terracotta
+    {"red": 0.60, "green": 0.11, "blue": 0.16},  # septembre — bordeaux (maquette)
+    {"red": 0.52, "green": 0.20, "blue": 0.35},  # octobre   — prune
+    {"red": 0.38, "green": 0.24, "blue": 0.47},  # novembre  — violet
+    {"red": 0.25, "green": 0.35, "blue": 0.50},  # décembre  — bleu acier
+]
+
+
+def couleur_en_tete_mois(mois: int) -> dict:
+    """Couleur d'en-tête associée à un mois (repli sur le bordeaux si le
+    numéro de mois est inattendu)."""
+    if 1 <= mois <= 12:
+        return COULEURS_EN_TETE_PAR_MOIS[mois]
+    return {"red": 0.60, "green": 0.11, "blue": 0.16}
 
 
 def construire_lignes_rapport(rapport: dict) -> tuple[list, int]:
@@ -1056,18 +1089,22 @@ def construire_lignes_rapport(rapport: dict) -> tuple[list, int]:
     return lignes, premiere_ligne_synthese
 
 
-def mettre_en_forme_rapport(feuille, nb_lignes_total: int, premiere_ligne_synthese: int) -> None:
-    """Applique la mise en forme de la maquette : en-tête bordeaux, montants
-    alignés à droite avec séparateur de milliers, synthèse en gras italique."""
+def mettre_en_forme_rapport(feuille, nb_lignes_total: int, premiere_ligne_synthese: int,
+                            mois: int = 0) -> None:
+    """Applique la mise en forme de la maquette : en-tête coloré selon le mois,
+    montants alignés à droite avec séparateur de milliers, synthèse en gras
+    italique. La couleur du mois est également appliquée à l'onglet lui-même,
+    pour repérer visuellement chaque feuille du classeur."""
     sheet_id = feuille.id
+    couleur = couleur_en_tete_mois(mois)
     requetes = [
-        # Ligne d'en-tête : fond bordeaux, texte blanc en gras
+        # Ligne d'en-tête : fond coloré selon le mois, texte blanc en gras
         {
             "repeatCell": {
                 "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
                           "startColumnIndex": 0, "endColumnIndex": 3},
                 "cell": {"userEnteredFormat": {
-                    "backgroundColor": COULEUR_EN_TETE,
+                    "backgroundColor": couleur,
                     "textFormat": {"bold": True,
                                    "foregroundColor": {"red": 1, "green": 1, "blue": 1}},
                     "verticalAlignment": "MIDDLE",
@@ -1122,18 +1159,72 @@ def mettre_en_forme_rapport(feuille, nb_lignes_total: int, premiere_ligne_synthe
                 "fields": "pixelSize",
             }
         },
+        # Couleur de l'onglet, assortie à celle de l'en-tête
+        {
+            "updateSheetProperties": {
+                "properties": {"sheetId": sheet_id, "tabColor": couleur},
+                "fields": "tabColor",
+            }
+        },
     ]
     feuille.spreadsheet.batch_update({"requests": requetes})
 
 
-NOM_ONGLET_RAPPORT = "Rapport {mois:02d}-{annee}"
+NOM_ONGLET_RAPPORT = "{nom_mois} {annee}"
+
+
+def positionner_onglet_chronologiquement(classeur, feuille, annee: int, mois: int) -> None:
+    """Range la feuille parmi les autres rapports mensuels, du plus ancien au
+    plus récent. Sans cela, chaque nouvel onglet se placerait en fin de
+    classeur : en traitant les mois dans le désordre, l'ordre des feuilles
+    deviendrait incohérent."""
+    reperes = {normaliser_texte(nom): numero for numero, nom in enumerate(NOMS_MOIS) if nom}
+
+    def periode_du_titre(titre: str):
+        """(année, mois) si le titre est un rapport mensuel, sinon None."""
+        morceaux = normaliser_texte(titre).split()
+        if len(morceaux) != 2 or morceaux[0] not in reperes:
+            return None
+        try:
+            return (int(morceaux[1]), reperes[morceaux[0]])
+        except ValueError:
+            return None
+
+    rapports = []
+    for onglet in classeur.worksheets():
+        periode = periode_du_titre(onglet.title)
+        if periode:
+            rapports.append((periode, onglet))
+
+    if len(rapports) < 2:
+        return  # une seule feuille de rapport : rien à ordonner
+
+    rapports.sort(key=lambda couple: couple[0])
+    position_voulue = next(
+        (rang for rang, (periode, _) in enumerate(rapports) if periode == (annee, mois)),
+        None,
+    )
+    if position_voulue is None:
+        return
+
+    # Les feuilles hors rapports (données du client, etc.) restent en tête.
+    decalage = len(classeur.worksheets()) - len(rapports)
+    index_cible = decalage + position_voulue
+    if feuille.index != index_cible:
+        classeur.reorder_worksheets(
+            [f for f in classeur.worksheets() if f.id != feuille.id][:index_cible]
+            + [feuille]
+            + [f for f in classeur.worksheets() if f.id != feuille.id][index_cible:]
+        )
 
 
 def nom_onglet_rapport_cible(rapport: dict) -> str:
     """Nom de l'onglet où écrire le rapport mensuel : celui choisi dans
     ⚙️ Paramètres s'il est renseigné, sinon un nom automatique par mois."""
     choisi = (st.session_state.config.get("nom_onglet_rapport") or "").strip()
-    return choisi or NOM_ONGLET_RAPPORT.format(mois=rapport["mois"], annee=rapport["annee"])
+    return choisi or NOM_ONGLET_RAPPORT.format(
+        nom_mois=NOMS_MOIS[rapport["mois"]].capitalize(), annee=rapport["annee"]
+    )
 
 
 def creer_rapport_mensuel_onglet(rapport: dict, nom_onglet: str = "") -> dict:
@@ -1167,7 +1258,14 @@ def creer_rapport_mensuel_onglet(rapport: dict, nom_onglet: str = "") -> dict:
         feuille = classeur.add_worksheet(title=nom_onglet, rows=max(len(lignes) + 10, 50), cols=6)
 
     feuille.update(f"A1:C{len(lignes)}", lignes, value_input_option=VALUE_INPUT_OPTION)
-    mettre_en_forme_rapport(feuille, len(lignes), premiere_ligne_synthese)
+    mettre_en_forme_rapport(feuille, len(lignes), premiere_ligne_synthese, mois=rapport["mois"])
+
+    try:
+        positionner_onglet_chronologiquement(classeur, feuille, rapport["annee"], rapport["mois"])
+    except Exception:
+        # Le rangement est un confort : son échec ne doit pas faire perdre
+        # un rapport correctement écrit.
+        pass
 
     return {
         "titre": nom_onglet,
@@ -1856,27 +1954,36 @@ else:
 
             tous_les_trous_geres = len(trous_a_traiter) == 0
 
+            peut_continuer = tous_les_trous_geres and poursuivre_malgre_doublon
+
+            def preparer_donnees_filtrees() -> None:
+                """Prépare les tableaux hebdomadaires à partir de l'analyse."""
+                for cle in list(st.session_state.keys()):
+                    if cle.startswith("editeur_recettes_") or cle.startswith("editeur_depenses_"):
+                        del st.session_state[cle]
+                filtres = {}
+                for indice, donnees in enumerate(st.session_state.lot_donnees):
+                    if "erreur" in donnees:
+                        continue
+                    filtre = filtrer_donnees_par_mois(donnees, debut_mois, fin_mois)
+                    filtres[indice] = {
+                        "recettes": filtre["recettes_journalieres"],
+                        "depenses": filtre["depenses"],
+                    }
+                st.session_state.donnees_filtrees = filtres
+                # Les éditions d'un lot précédent ne doivent pas être reprises :
+                # les tableaux repartent des données fraîchement analysées.
+                st.session_state.donnees_editees = {}
+                st.session_state.mois_confirme = True
+
             col_go, col_retour = st.columns(2)
             with col_go:
                 if st.button(
                     "➡️ Continuer vers la vérification des rapports",
                     type="primary",
-                    disabled=not (tous_les_trous_geres and poursuivre_malgre_doublon),
+                    disabled=not peut_continuer,
                 ):
-                    for cle in list(st.session_state.keys()):
-                        if cle.startswith("editeur_recettes_") or cle.startswith("editeur_depenses_"):
-                            del st.session_state[cle]
-                    filtres = {}
-                    for i, donnees in enumerate(st.session_state.lot_donnees):
-                        if "erreur" in donnees:
-                            continue
-                        filtre = filtrer_donnees_par_mois(donnees, debut_mois, fin_mois)
-                        filtres[i] = {
-                            "recettes": filtre["recettes_journalieres"],
-                            "depenses": filtre["depenses"],
-                        }
-                    st.session_state.donnees_filtrees = filtres
-                    st.session_state.mois_confirme = True
+                    preparer_donnees_filtrees()
                     st.session_state.sous_page = 0
                     st.rerun()
             with col_retour:
@@ -1886,6 +1993,40 @@ else:
                     st.session_state.fichiers_combles = {}
                     st.session_state.ordre_chronologique = None
                     st.rerun()
+
+            st.caption(
+                "Si tu fais confiance à la lecture de l'IA et n'as aucune correction à apporter, "
+                "tu peux passer directement au bilan. Les données resteront consultables et "
+                "modifiables ensuite, semaine par semaine."
+            )
+            if st.button(
+                "⏭️ Passer la vérification et établir le bilan",
+                use_container_width=True,
+                disabled=not peut_continuer,
+            ):
+                preparer_donnees_filtrees()
+                # Toutes les semaines exploitables sont validées d'office, et
+                # le bilan est calculé dans la foulée à partir des données
+                # issues de l'analyse, sans passer par les pages hebdomadaires.
+                indices_exploitables = [
+                    indice for indice, donnees in enumerate(st.session_state.lot_donnees)
+                    if "erreur" not in donnees
+                ]
+                st.session_state.semaines_validees = set(indices_exploitables)
+
+                recettes_combinees = []
+                depenses_combinees = []
+                for indice in indices_exploitables:
+                    recettes_combinees.extend(obtenir_donnees_semaine(indice, "recettes"))
+                    depenses_combinees.extend(obtenir_donnees_semaine(indice, "depenses"))
+
+                st.session_state.rapport_fige = calculer_bilan_mensuel_agrege(
+                    recettes_combinees, depenses_combinees, debut_mois.year, debut_mois.month
+                )
+                st.session_state.bilan_etabli = True
+                st.session_state.sous_page = len(st.session_state.lot_donnees)
+                st.rerun()
+
             st.stop()
 
         # ============================================================
