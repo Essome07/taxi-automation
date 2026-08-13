@@ -356,6 +356,12 @@ NOMS_MOIS = ["", "janvier", "février", "mars", "avril", "mai", "juin", "juillet
 
 MAX_IMAGES_PAR_LOT = 5
 
+# Recette d'une journée pleine. Le nombre de jours travaillés en découle :
+# recette totale ÷ tarif. Une journée à moitié travaillée (7 500 F) compte
+# ainsi pour 0,5 jour, ce qu'un simple comptage de dates ne permettait pas.
+TARIF_JOURNALIER_DEFAUT = 15000
+
+
 # Feuille principale : une colonne par mois (mois + décalage), 3 lignes de bilan
 # Colonne D = janvier => colonne = numéro du mois + 3
 OFFSET_COLONNE_MOIS = 3
@@ -374,6 +380,7 @@ def charger_config() -> dict:
         "sheet_principale_id": SHEET_PRINCIPALE_ID_DEFAUT,
         "nom_onglet_rapport": "",
         "nom_utilisateur": "Pascal",
+        "tarif_journalier": TARIF_JOURNALIER_DEFAUT,
     }
     if os.path.exists(CONFIG_PATH):
         try:
@@ -1059,6 +1066,26 @@ def filtrer_donnees_par_mois(donnees: dict, debut_mois, fin_mois) -> dict:
     return {**donnees, "recettes_journalieres": recettes_filtrees, "depenses": depenses_filtrees}
 
 
+def tarif_journalier() -> float:
+    """Recette d'une journée pleine, servant de base au calcul des jours
+    travaillés. Se protège d'une valeur nulle ou absurde, qui ferait échouer
+    la division."""
+    try:
+        valeur = float(st.session_state.config.get("tarif_journalier") or TARIF_JOURNALIER_DEFAUT)
+    except (TypeError, ValueError):
+        valeur = TARIF_JOURNALIER_DEFAUT
+    return valeur if valeur > 0 else TARIF_JOURNALIER_DEFAUT
+
+
+def formater_jours(valeur: float) -> str:
+    """Affiche un nombre de jours sans décimale inutile : 26 plutôt que 26,0,
+    mais 26,5 quand la demi-journée compte."""
+    valeur = round(float(valeur), 2)
+    if valeur.is_integer():
+        return str(int(valeur))
+    return f"{valeur:.2f}".rstrip("0").rstrip(".").replace(".", ",")
+
+
 def calculer_bilan_mensuel_agrege(recettes_combinees: list[dict], depenses_combinees: list[dict], annee: int, mois: int) -> dict:
     """Construit le rapport détaillé du mois à partir des données déjà
     filtrées/éditées en mémoire (plus besoin de relire une feuille)."""
@@ -1092,7 +1119,11 @@ def calculer_bilan_mensuel_agrege(recettes_combinees: list[dict], depenses_combi
     return {
         "annee": annee,
         "mois": mois,
-        "jours_travailles": len(jours_recette),
+        # Nombre de jours au sens économique : recette ÷ tarif journalier.
+        # Une journée partiellement travaillée compte donc pour une fraction.
+        "jours_travailles": round(recette_totale / tarif_journalier(), 2),
+        # Nombre de dates distinctes, conservé pour information.
+        "jours_distincts": len(jours_recette),
         "recette_totale": recette_totale,
         "depenses_par_titre": depenses_par_titre,
         "depenses_detaillees": depenses_detaillees,
@@ -1147,7 +1178,10 @@ def construire_lignes_rapport(rapport: dict) -> tuple[list, int]:
 
     premiere_ligne_synthese = len(lignes) + 1
     lignes.extend([
-        ["Nombre de jours travaillés", "", rapport["jours_travailles"]],
+        # La colonne du milieu rappelle le tarif : sans lui, un lecteur du
+        # classeur ne comprendrait pas d'où sort un nombre de jours décimal.
+        ["Nombre de jours travaillés", f"à {formater_montant(tarif_journalier())} F/jour",
+         rapport["jours_travailles"]],
         ["Recette totale", "", rapport["recette_totale"]],
         ["Dépenses totales", "", rapport["total_depenses"]],
         ["Solde net", "", rapport["solde_net"]],
@@ -1195,6 +1229,19 @@ def mettre_en_forme_rapport(feuille, nb_lignes_total: int, premiere_ligne_synthe
                     "horizontalAlignment": "RIGHT",
                 }},
                 "fields": "userEnteredFormat(numberFormat,horizontalAlignment)",
+            }
+        },
+        # Jours travaillés : format décimal, sinon 26,5 s'afficherait arrondi à 27
+        {
+            "repeatCell": {
+                "range": {"sheetId": sheet_id,
+                          "startRowIndex": premiere_ligne_synthese - 1,
+                          "endRowIndex": premiere_ligne_synthese,
+                          "startColumnIndex": 2, "endColumnIndex": 3},
+                "cell": {"userEnteredFormat": {
+                    "numberFormat": {"type": "NUMBER", "pattern": "#,##0.##"},
+                }},
+                "fields": "userEnteredFormat.numberFormat",
             }
         },
         # Bloc de synthèse : gras italique, comme sur la maquette
@@ -1958,7 +2005,7 @@ def afficher_bilan_mensuel(rapport: dict) -> None:
     st.markdown(f"### 🎉 Bilan du mois de {nom_mois} {rapport['annee']}")
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Jours travaillés", rapport["jours_travailles"])
+    c1.metric("Jours travaillés", formater_jours(rapport["jours_travailles"]))
     c2.metric("Recette totale", f"{formater_montant(rapport['recette_totale'])} FCFA")
     c3.metric("Solde net", f"{formater_montant(rapport['solde_net'])} FCFA")
     st.metric("Total dépenses", f"{formater_montant(rapport['total_depenses'])} FCFA")
@@ -2030,6 +2077,15 @@ if st.session_state.page == "⚙️ Paramètres":
     st.subheader("Préférences")
     nouveau_nom = st.text_input("Ton prénom (utilisé dans la salutation)", value=st.session_state.config["nom_utilisateur"])
 
+    nouveau_tarif = st.number_input(
+        "Recette d'une journée pleine (FCFA)",
+        min_value=1,
+        step=500,
+        value=int(st.session_state.config.get("tarif_journalier") or TARIF_JOURNALIER_DEFAUT),
+        help="Sert à calculer le nombre de jours travaillés : recette totale ÷ ce tarif. "
+             "Une journée à moitié travaillée compte ainsi pour 0,5 jour.",
+    )
+
     st.caption(
         "Le classeur de destination se choisit désormais directement sur la page "
         "📊 Bilan mensuel, au moment de l'écriture."
@@ -2046,6 +2102,7 @@ if st.session_state.page == "⚙️ Paramètres":
         st.session_state.config = {
             **st.session_state.config,
             "nom_utilisateur": nouveau_nom.strip() or "Pascal",
+            "tarif_journalier": int(nouveau_tarif),
         }
         sauvegarder_config(st.session_state.config)
         st.success("✅ Paramètres enregistrés.")
