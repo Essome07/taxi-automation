@@ -13,7 +13,6 @@ Le taximan envoie un lot de 5 photos de rapports hebdomadaires manuscrits
 
 Interface organisée en 3 sections (barre latérale) :
   - 📤 Nouveau rapport : le flux principal d'analyse/enregistrement
-  - 🔃 Maintenance     : outils divers
   - ⚙️ Paramètres      : choix du fichier Google Sheets + préférences
 """
 
@@ -177,6 +176,10 @@ FEUILLE_DE_STYLE = """
     width: 100%; height: 100%;
     object-fit: cover;
 }
+.carte-semaine .vignette.sans-photo {
+    font-size: 1.8rem;
+    color: var(--texte-doux);
+}
 .carte-semaine .corps { padding: 10px 12px 12px 12px; }
 .carte-semaine .nom { font-weight: 700; font-size: 0.9rem; }
 .carte-semaine .periode {
@@ -305,11 +308,24 @@ def afficher_cartes_semaines(fichiers: list, lot_donnees) -> None:
         else:
             periode = donnees.get("periode_hebdo") or "Période non détectée"
             total = calculer_total_recettes(donnees.get("recettes_journalieres", []))
-            statut, classe = f"Analysée · {formater_montant(total)} FCFA", "ok"
+            if donnees.get("saisie_manuelle"):
+                statut, classe = f"Saisie manuelle · {formater_montant(total)} FCFA", "ok"
+            else:
+                statut, classe = f"Analysée · {formater_montant(total)} FCFA", "ok"
+
+        # Une semaine saisie à la main n'a pas de photo : on affiche un
+        # symbole de substitution plutôt que de tenter une vignette.
+        if fichier is None:
+            vignette = '<div class="vignette sans-photo">✍️</div>'
+        else:
+            vignette = (
+                f'<div class="vignette">'
+                f'<img src="data:image/jpeg;base64,{vignette_base64(fichier)}"></div>'
+            )
 
         cartes.append(
             f'<div class="carte-semaine">'
-            f'<div class="vignette"><img src="data:image/jpeg;base64,{vignette_base64(fichier)}"></div>'
+            f'{vignette}'
             f'<div class="corps">'
             f'<div class="nom">Semaine {indice + 1}</div>'
             f'<div class="periode">{echapper_html(periode)}</div>'
@@ -2055,7 +2071,7 @@ with st.sidebar:
     st.divider()
     st.session_state.page = st.radio(
         "Navigation",
-        ["📤 Nouveau rapport", "🔃 Maintenance", "⚙️ Paramètres"],
+        ["📤 Nouveau rapport", "⚙️ Paramètres"],
         label_visibility="collapsed",
     )
     st.divider()
@@ -2137,6 +2153,9 @@ if st.session_state.page == "⚙️ Paramètres":
 
     if st.button("🔌 Vérifier l'accès et la structure du classeur", type="primary"):
         with st.spinner("Vérification en cours..."):
+            # Repart d'une connexion neuve : évite les erreurs « No grid with id »
+            # qui surviennent quand la structure du classeur a changé depuis.
+            get_gspread_client.clear()
             sheet_id = st.session_state.config["sheet_principale_id"]
             try:
                 diagnostic = diagnostiquer_acces_feuille(sheet_id)
@@ -2186,25 +2205,6 @@ if st.session_state.page == "⚙️ Paramètres":
 # ============================================================
 # PAGE : MAINTENANCE
 # ============================================================
-elif st.session_state.page == "🔃 Maintenance":
-    st.title("🔃 Maintenance")
-    st.caption(
-        "Depuis le passage à une feuille Google Sheets unique, il n'y a plus de "
-        "tri ni de nettoyage de lignes à faire ici : seul le bilan mensuel (une "
-        "colonne par mois) est écrit, directement depuis la page 📊 Bilan mensuel."
-    )
-
-    st.divider()
-    st.subheader("En cas de problème")
-    st.caption(
-        "Si tu obtiens une erreur du type « No grid with id » ou une erreur de "
-        "connexion inhabituelle après avoir modifié la structure de ton fichier "
-        "Google Sheets, clique ici."
-    )
-    if st.button("🔄 Forcer une reconnexion complète"):
-        get_gspread_client.clear()
-        st.success("✅ Connexion réinitialisée.")
-
 # ============================================================
 # PAGE : NOUVEAU RAPPORT
 # ============================================================
@@ -2265,8 +2265,8 @@ else:
             for cle in list(st.session_state.keys()):
                 if cle.startswith("editeur_recettes_") or cle.startswith("editeur_depenses_"):
                     del st.session_state[cle]
-            # Copie en mémoire : le lot doit survivre à un passage par
-            # Maintenance ou Paramètres, qui vide le file_uploader.
+            # Copie en mémoire : le lot doit survivre à un passage par la page
+            # Paramètres, qui vide le file_uploader.
             st.session_state.fichiers_lot = memoriser_fichiers(fichiers_uploades)
             st.session_state.signature_lot = signature
             st.session_state.lot_donnees = None
@@ -2745,7 +2745,7 @@ else:
         # --------------------------------------------------------
         if page_actuelle < nb_rapports_total:
             i = page_actuelle
-            fichier_i = tous_les_fichiers[i]
+            fichier_i = tous_les_fichiers[i] if i < len(tous_les_fichiers) else None
             donnees_brutes = st.session_state.lot_donnees[i]
 
             st.divider()
@@ -2767,11 +2767,19 @@ else:
 
                 col_img, col_data = st.columns([1, 1.4])
                 with col_img:
-                    st.image(fichier_i, caption=fichier_i.name, use_container_width=True)
+                    if fichier_i is not None:
+                        st.image(fichier_i, caption=fichier_i.name, use_container_width=True)
+                    else:
+                        st.info(
+                            "✍️ Semaine saisie manuellement : il n'y a pas de photo à afficher. "
+                            "Les données restent modifiables ci-contre."
+                        )
 
                 with col_data:
+                    origine = ("Période saisie" if donnees_brutes.get("saisie_manuelle")
+                               else "Période brute détectée sur l'image")
                     st.caption(
-                        f"Période brute détectée sur l'image : **{donnees_brutes.get('periode_hebdo', '—')}**. "
+                        f"{origine} : **{donnees_brutes.get('periode_hebdo', '—')}**. "
                         f"Seuls les jours du mois confirmé ({debut_mois.strftime('%d/%m/%y')} - "
                         f"{fin_mois.strftime('%d/%m/%y')}) sont pris en compte ci-dessous."
                     )
