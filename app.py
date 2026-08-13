@@ -378,12 +378,6 @@ MAX_IMAGES_PAR_LOT = 5
 TARIF_JOURNALIER_DEFAUT = 15000
 
 
-# Feuille principale : une colonne par mois (mois + décalage), 3 lignes de bilan
-# Colonne D = janvier => colonne = numéro du mois + 3
-OFFSET_COLONNE_MOIS = 3
-LIGNE_RECETTES_MENSUEL = 4
-LIGNE_DEPENSES_MENSUEL = 5
-LIGNE_SOLDE_MENSUEL = 6
 
 VALUE_INPUT_OPTION = "USER_ENTERED"  # évite que Sheets force les nombres en texte (bug de l'apostrophe)
 
@@ -429,14 +423,6 @@ def obtenir_email_service_account() -> str:
         return data.get("client_email", "inconnu")
     except Exception:
         return "inconnu"
-
-
-def numero_colonne_vers_lettre(n: int) -> str:
-    lettres = ""
-    while n > 0:
-        n, reste = divmod(n - 1, 26)
-        lettres = chr(65 + reste) + lettres
-    return lettres
 
 
 # ============================================================
@@ -552,24 +538,6 @@ def get_gemini_key() -> str:
             "Vérifie qu'une ligne `GEMINI_API_KEY = \"...\"` existe bien dans les secrets "
             "(⋮ → Settings → Secrets sur Streamlit Cloud), puis redémarre l'application."
         ) from exc
-
-
-def get_clients(sheet_principale_id: str):
-    """Récupère la feuille de calcul à CHAQUE appel (volontairement PAS mise
-    en cache) : si on gardait l'objet Worksheet en mémoire, un onglet
-    supprimé/recréé manuellement dans Google Sheets casserait l'app avec une
-    erreur 'No grid with id ...' jusqu'au redémarrage. Cet appel API est
-    rapide et peu coûteux vu la fréquence d'utilisation de l'app."""
-    gc = get_gspread_client()
-    api_key = get_gemini_key()
-    feuille_principale = gc.open_by_key(sheet_principale_id).get_worksheet(0)
-    return api_key, feuille_principale
-
-
-def get_clients_config():
-    """Raccourci qui lit l'identifiant depuis la config utilisateur en session."""
-    config = st.session_state.config
-    return get_clients(config["sheet_principale_id"])
 
 
 # ============================================================
@@ -1321,11 +1289,9 @@ def positionner_onglet_chronologiquement(classeur, feuille, annee: int, mois: in
     plus récent. Sans cela, chaque nouvel onglet se placerait en fin de
     classeur : en traitant les mois dans le désordre, l'ordre des feuilles
     deviendrait incohérent."""
-    periode_du_titre = periode_du_titre_onglet
-
     rapports = []
     for onglet in classeur.worksheets():
-        periode = periode_du_titre(onglet.title)
+        periode = periode_du_titre_onglet(onglet.title)
         if periode:
             rapports.append((periode, onglet))
 
@@ -1817,22 +1783,6 @@ def creer_rapport_mensuel_onglet(rapport: dict, nom_onglet: str = "") -> dict:
     }
 
 
-def enregistrer_bilan_mensuel(feuille_principale, rapport: dict) -> None:
-    """Écrit le bilan (recettes, dépenses, solde) du mois dans la feuille
-    principale, dans la colonne correspondant à ce mois."""
-    colonne_mois = rapport["mois"] + OFFSET_COLONNE_MOIS
-    lettre_col = numero_colonne_vers_lettre(colonne_mois)
-    feuille_principale.update(
-        f"{lettre_col}{LIGNE_RECETTES_MENSUEL}", [[rapport["recette_totale"]]], value_input_option=VALUE_INPUT_OPTION
-    )
-    feuille_principale.update(
-        f"{lettre_col}{LIGNE_DEPENSES_MENSUEL}", [[rapport["total_depenses"]]], value_input_option=VALUE_INPUT_OPTION
-    )
-    feuille_principale.update(
-        f"{lettre_col}{LIGNE_SOLDE_MENSUEL}", [[rapport["solde_net"]]], value_input_option=VALUE_INPUT_OPTION
-    )
-
-
 # ============================================================
 # ONGLET "EXPENSES" DE LA FEUILLE DU CLIENT
 # Lecture de la structure existante, appariement des dépenses du
@@ -1889,7 +1839,6 @@ for cle, defaut in {
     "donnees_filtrees": None,
     "mois_confirme": False,
     "sous_page": 0,
-    "bilan_enregistre": False,
     "trous_ignores": set(),
     "fichiers_combles": {},
     "ordre_chronologique": None,
@@ -1920,7 +1869,6 @@ def reinitialiser_lot() -> None:
     st.session_state.donnees_filtrees = None
     st.session_state.mois_confirme = False
     st.session_state.sous_page = 0
-    st.session_state.bilan_enregistre = False
     st.session_state.trous_ignores = set()
     st.session_state.fichiers_combles = {}
     st.session_state.ordre_chronologique = None
@@ -2273,7 +2221,6 @@ else:
             st.session_state.donnees_filtrees = None
             st.session_state.mois_confirme = False
             st.session_state.sous_page = 0
-            st.session_state.bilan_enregistre = False
             st.session_state.trous_ignores = set()
             st.session_state.fichiers_combles = {}
             st.session_state.ordre_chronologique = None
@@ -2963,7 +2910,6 @@ else:
                     st.session_state.bilan_etabli = False
                     st.session_state.rapport_fige = None
                     st.session_state.semaines_validees = set()
-                    st.session_state.bilan_enregistre = False
                     st.session_state.rapport_mensuel_cree = None
                     st.session_state.sous_page = 0
                     st.rerun()
@@ -3109,26 +3055,6 @@ else:
                             st.rerun()
                         except Exception as e:
                             st.error(f"🚨 Création impossible : {message_erreur_sheets(e)}")
-
-            st.divider()
-            with st.expander("📄 Enregistrer aussi le résumé (recettes / dépenses / solde) sur le premier onglet"):
-                st.caption(
-                    "Écrit les 3 totaux du mois dans le premier onglet du classeur "
-                    f"(lignes {LIGNE_RECETTES_MENSUEL} à {LIGNE_SOLDE_MENSUEL}). "
-                    "À n'utiliser que si cet onglet est bien prévu pour ça."
-                )
-                if st.session_state.bilan_enregistre:
-                    st.success("✅ Résumé déjà enregistré.")
-                elif st.button("💾 Enregistrer le résumé mensuel"):
-                    with st.spinner("Écriture en cours..."):
-                        try:
-                            _, feuille_principale = get_clients_config()
-                            enregistrer_bilan_mensuel(feuille_principale, rapport)
-                            st.session_state.bilan_enregistre = True
-                            st.success("✨ Résumé mensuel enregistré.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"🚨 Une erreur est survenue lors de l'enregistrement : {message_erreur_sheets(e)}")
 
             st.divider()
             if st.button("📥 Traiter un nouveau lot d'images (mois suivant)"):
