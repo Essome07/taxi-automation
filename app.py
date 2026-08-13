@@ -202,6 +202,30 @@ FEUILLE_DE_STYLE = """
     color: #C0392B;
 }
 
+/* --- Panneau de l'agent de suivi --- */
+.panneau-agent {
+    background: var(--fond-carte);
+    border: 1px solid var(--bordure);
+    border-left: 3px solid var(--accent);
+    border-radius: 10px;
+    padding: 12px 16px;
+    margin: 6px 0 16px 0;
+}
+.panneau-agent .titre-agent {
+    font-size: 0.68rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--texte-doux);
+    margin-bottom: 8px;
+}
+.panneau-agent .ligne-agent {
+    font-size: 0.92rem;
+    line-height: 1.5;
+    padding: 3px 0;
+}
+.panneau-agent .ligne-agent.alerte { color: #D98324; }
+.panneau-agent .ligne-agent.succes { color: #4C9A5A; }
+
 /* --- Tableaux et éditeurs --- */
 /* Pas de `overflow: hidden` ici : la barre d'outils du tableau (ajout et
    suppression de lignes) flotte au-dessus du coin supérieur droit et serait
@@ -1173,22 +1197,26 @@ def mettre_en_forme_rapport(feuille, nb_lignes_total: int, premiere_ligne_synthe
 NOM_ONGLET_RAPPORT = "{nom_mois} {annee}"
 
 
+def periode_du_titre_onglet(titre: str):
+    """(année, mois) si le titre d'onglet correspond à un rapport mensuel
+    (ex. « Avril 2026 »), sinon None. Sert à la fois au rangement des feuilles
+    et à l'agent de suivi, qui s'en sert pour savoir quels mois sont traités."""
+    reperes = {normaliser_texte(nom): numero for numero, nom in enumerate(NOMS_MOIS) if nom}
+    morceaux = normaliser_texte(titre).split()
+    if len(morceaux) != 2 or morceaux[0] not in reperes:
+        return None
+    try:
+        return (int(morceaux[1]), reperes[morceaux[0]])
+    except ValueError:
+        return None
+
+
 def positionner_onglet_chronologiquement(classeur, feuille, annee: int, mois: int) -> None:
     """Range la feuille parmi les autres rapports mensuels, du plus ancien au
     plus récent. Sans cela, chaque nouvel onglet se placerait en fin de
     classeur : en traitant les mois dans le désordre, l'ordre des feuilles
     deviendrait incohérent."""
-    reperes = {normaliser_texte(nom): numero for numero, nom in enumerate(NOMS_MOIS) if nom}
-
-    def periode_du_titre(titre: str):
-        """(année, mois) si le titre est un rapport mensuel, sinon None."""
-        morceaux = normaliser_texte(titre).split()
-        if len(morceaux) != 2 or morceaux[0] not in reperes:
-            return None
-        try:
-            return (int(morceaux[1]), reperes[morceaux[0]])
-        except ValueError:
-            return None
+    periode_du_titre = periode_du_titre_onglet
 
     rapports = []
     for onglet in classeur.worksheets():
@@ -1216,6 +1244,167 @@ def positionner_onglet_chronologiquement(classeur, feuille, annee: int, mois: in
             + [feuille]
             + [f for f in classeur.worksheets() if f.id != feuille.id][index_cible:]
         )
+
+
+# ============================================================
+# AGENT DE SUIVI
+# ------------------------------------------------------------
+# Petit assistant qui consulte le classeur du client pour savoir
+# quels mois sont déjà traités, en déduire celui qu'il attend, et
+# signaler les anomalies au fil du parcours (mois déjà présent,
+# mois sautés, semaines manquantes).
+# ============================================================
+def mois_suivant(periode: tuple) -> tuple:
+    annee, mois = periode
+    return (annee + 1, 1) if mois == 12 else (annee, mois + 1)
+
+
+def libelle_periode(periode: tuple) -> str:
+    annee, mois = periode
+    return f"{NOMS_MOIS[mois]} {annee}"
+
+
+def mois_manquants_entre(depuis: tuple, jusqu_a: tuple) -> list:
+    """Mois absents strictement entre deux périodes (bornes exclues)."""
+    manquants = []
+    courant = mois_suivant(depuis)
+    while courant < jusqu_a:
+        manquants.append(courant)
+        courant = mois_suivant(courant)
+    return manquants
+
+
+def lire_mois_enregistres() -> list:
+    """Périodes déjà présentes dans le classeur, triées.
+
+    C'est ce qui permet à l'agent de « voir » le travail déjà fait : il lit les
+    titres des onglets plutôt que leur contenu, ce qui reste rapide même sur un
+    classeur chargé."""
+    classeur = get_gspread_client().open_by_key(st.session_state.config["sheet_principale_id"])
+    periodes = [
+        periode for periode in (periode_du_titre_onglet(f.title) for f in classeur.worksheets())
+        if periode
+    ]
+    return sorted(periodes)
+
+
+def rafraichir_suivi(silencieux: bool = True) -> None:
+    """Recharge l'état du suivi depuis le classeur, sans jamais interrompre le
+    parcours : si le classeur est inaccessible, l'agent se met simplement en
+    retrait plutôt que d'afficher une erreur bloquante."""
+    try:
+        st.session_state.mois_enregistres = lire_mois_enregistres()
+        st.session_state.suivi_erreur = None
+    except Exception as exc:
+        st.session_state.mois_enregistres = None
+        st.session_state.suivi_erreur = message_erreur_sheets(exc)
+        if not silencieux:
+            st.error(f"🚨 Suivi indisponible : {st.session_state.suivi_erreur}")
+
+
+def periode_attendue(mois_enregistres) -> tuple:
+    """Mois que l'agent attend ensuite : celui qui suit le dernier enregistré."""
+    if not mois_enregistres:
+        return None
+    return mois_suivant(mois_enregistres[-1])
+
+
+def diagnostic_suivi(mois_enregistres, mois_en_cours=None) -> list:
+    """Messages de l'agent sur l'état du suivi : {niveau, texte}.
+
+    `mois_en_cours` est la période détectée dans le lot en cours d'analyse ;
+    quand elle est fournie, l'agent la confronte à ce qu'il attendait."""
+    messages = []
+
+    if mois_enregistres is None:
+        return [{
+            "niveau": "info",
+            "texte": "Je n'ai pas encore pu consulter le classeur : le suivi des mois est indisponible.",
+        }]
+
+    attendue = periode_attendue(mois_enregistres)
+
+    if not mois_enregistres:
+        messages.append({
+            "niveau": "info",
+            "texte": "Aucun rapport mensuel n'est encore enregistré dans ce classeur. "
+                     "Le premier lot que tu analyseras ouvrira le suivi.",
+        })
+    else:
+        messages.append({
+            "niveau": "info",
+            "texte": f"{len(mois_enregistres)} mois déjà enregistré(s), jusqu'à "
+                     f"**{libelle_periode(mois_enregistres[-1])}**. "
+                     f"J'attends maintenant les données de **{libelle_periode(attendue)}**.",
+        })
+
+        trous = []
+        for precedent, suivant in zip(mois_enregistres, mois_enregistres[1:]):
+            trous.extend(mois_manquants_entre(precedent, suivant))
+        if trous:
+            messages.append({
+                "niveau": "alerte",
+                "texte": "Il manque des mois dans le suivi : "
+                         + ", ".join(f"**{libelle_periode(t)}**" for t in trous) + ".",
+            })
+
+    if mois_en_cours:
+        if mois_en_cours in mois_enregistres:
+            messages.append({
+                "niveau": "alerte",
+                "texte": f"**{libelle_periode(mois_en_cours)}** figure déjà dans le classeur. "
+                         "Écrire ce rapport remplacera les données existantes de ce mois.",
+            })
+        elif attendue is None:
+            messages.append({
+                "niveau": "succes",
+                "texte": f"Ce lot ouvre le suivi sur **{libelle_periode(mois_en_cours)}**.",
+            })
+        elif mois_en_cours == attendue:
+            messages.append({
+                "niveau": "succes",
+                "texte": f"Ce lot couvre bien **{libelle_periode(mois_en_cours)}**, "
+                         "le mois que j'attendais : la continuité est respectée.",
+            })
+        elif mois_en_cours < attendue:
+            messages.append({
+                "niveau": "alerte",
+                "texte": f"Ce lot couvre **{libelle_periode(mois_en_cours)}**, antérieur au mois "
+                         f"attendu (**{libelle_periode(attendue)}**). Vérifie qu'il s'agit bien "
+                         "des photos que tu voulais traiter.",
+            })
+        else:
+            sautes = mois_manquants_entre(mois_enregistres[-1], mois_en_cours)
+            messages.append({
+                "niveau": "alerte",
+                "texte": f"Ce lot couvre **{libelle_periode(mois_en_cours)}**, mais "
+                         + ", ".join(f"**{libelle_periode(m)}**" for m in sautes)
+                         + " n'a pas encore été traité. Tu peux poursuivre, ce mois restera à faire.",
+            })
+
+    return messages
+
+
+def afficher_agent(messages: list, titre: str = "Assistant de suivi") -> None:
+    """Affiche les messages de l'agent dans un encadré unique."""
+    if not messages:
+        return
+
+    icones = {"info": "💬", "alerte": "⚠️", "succes": "✅"}
+    lignes = "".join(
+        f'<div class="ligne-agent {m["niveau"]}">{icones.get(m["niveau"], "•")} '
+        f'{convertir_gras(echapper_html(m["texte"]))}</div>'
+        for m in messages
+    )
+    st.markdown(
+        f'<div class="panneau-agent"><div class="titre-agent">🤖 {echapper_html(titre)}</div>{lignes}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def convertir_gras(texte: str) -> str:
+    """Convertit la syntaxe **gras** en HTML, après échappement du texte."""
+    return re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", texte)
 
 
 def nom_onglet_rapport_cible(rapport: dict) -> str:
@@ -1335,6 +1524,9 @@ def message_erreur_sheets(exc: Exception) -> str:
 for cle, defaut in {
     "config": None,
     "cle_uploader": 0,
+    "mois_enregistres": None,
+    "suivi_erreur": None,
+    "suivi_charge": False,
     "signature_lot": None,
     "fichiers_lot": None,
     "page": "📤 Nouveau rapport",
@@ -1683,6 +1875,28 @@ else:
         _etape_courante = 4
     afficher_fil_etapes(_etape_courante)
 
+    # Premier passage : l'agent consulte le classeur pour savoir où en est le suivi.
+    if not st.session_state.suivi_charge:
+        with st.spinner("Consultation du classeur..."):
+            rafraichir_suivi()
+        st.session_state.suivi_charge = True
+
+    # Période du lot en cours, dès qu'elle est connue, pour que l'agent la
+    # confronte au mois qu'il attendait.
+    _mois_du_lot = None
+    if st.session_state.lot_donnees:
+        _debut_lot, _ = determiner_bornes_mois(st.session_state.lot_donnees)
+        if _debut_lot:
+            _mois_du_lot = (_debut_lot.year, _debut_lot.month)
+
+    afficher_agent(diagnostic_suivi(st.session_state.mois_enregistres, _mois_du_lot))
+
+    col_maj, col_vide = st.columns([1, 3])
+    with col_maj:
+        if st.button("🔄 Actualiser le suivi", use_container_width=True):
+            rafraichir_suivi(silencieux=False)
+            st.rerun()
+
     st.write(f"Uploade exactement {MAX_IMAGES_PAR_LOT} rapports hebdomadaires (un mois complet, glisser-déposer possible).")
 
     fichiers_uploades = st.file_uploader(
@@ -1891,12 +2105,16 @@ else:
             ]
 
             if trous_a_traiter:
+                messages_trous = [{
+                    "niveau": "alerte",
+                    "texte": f"Les données de la période du **{debut.strftime('%d/%m')}** au "
+                             f"**{fin.strftime('%d/%m')}** sont manquantes. Veux-tu ajouter la photo "
+                             "correspondante, ou poursuivre sans elle ?",
+                } for debut, fin in trous_a_traiter]
+                afficher_agent(messages_trous, titre="Assistant — semaines manquantes")
+
                 for debut_trou, fin_trou in trous_a_traiter:
                     cle_trou = f"{debut_trou.isoformat()}_{fin_trou.isoformat()}"
-                    st.warning(
-                        f"⚠️ La période du **{debut_trou.strftime('%d/%m/%y')}** au "
-                        f"**{fin_trou.strftime('%d/%m/%y')}** manque."
-                    )
                     with st.expander(f"Gérer la période manquante du {debut_trou.strftime('%d/%m/%y')} au {fin_trou.strftime('%d/%m/%y')}"):
                         fichier_combler = st.file_uploader(
                             "Ajoute la photo de cette semaine si tu l'as (elle sera vérifiée automatiquement)",
@@ -2419,6 +2637,9 @@ else:
                                 rapport, nom_onglet=onglet_choisi
                             )
                             st.session_state.onglets_classeur = None
+                            # Le classeur vient de changer : l'agent doit en
+                            # tenir compte pour annoncer le prochain mois attendu.
+                            rafraichir_suivi()
                             st.rerun()
                         except Exception as e:
                             st.error(f"🚨 Création impossible : {message_erreur_sheets(e)}")
