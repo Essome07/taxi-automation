@@ -1,22 +1,16 @@
 # Thème de l'application — à placer dans .streamlit/config.toml
 #
-# Deux thèmes sont définis : l'utilisateur bascule de l'un à l'autre depuis
-# le menu « ⋮ » (en haut à droite) → Settings → Theme.
+# Thème sombre appliqué par défaut. Pour essayer le mode clair, le menu « ⋮ »
+# en haut à droite de la page permet de basculer immédiatement : ce réglage
+# appartient à Streamlit et couvre toute l'interface, tableaux compris.
 
 [theme]
 base = "dark"
-primaryColor = "#E8A33D"
+primaryColor = "#E8A33D"             # ambre : boutons principaux, éléments actifs
+backgroundColor = "#14161A"          # fond principal
+secondaryBackgroundColor = "#1C1F26" # barre latérale, cartes, champs
+textColor = "#E8E6E3"
 font = "sans serif"
 
-[theme.dark]
-backgroundColor = "#14161A"
-secondaryBackgroundColor = "#1C1F26"
-textColor = "#E8E6E3"
-
-[theme.light]
-backgroundColor = "#FAF9F7"
-secondaryBackgroundColor = "#FFFFFF"
-textColor = "#1F2124"
-
 [server]
-maxUploadSize = 25
+maxUploadSize = 25                   # 5 photos de rapport : 25 Mo suffisent largement
